@@ -22,7 +22,8 @@ from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode import (
 )
 from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
     fused_gdn_fwd_decode_gluon, fused_gdn_fwd_decode_gluon_v2, fused_gdn_fwd_decode_gluon_v3, 
-    fused_gdn_fwd_decode_gluon_v4, fused_gdn_fwd_decode_gluon_v5, fused_gdn_fwd_decode_gluon_v6
+    fused_gdn_fwd_decode_gluon_v4, fused_gdn_fwd_decode_gluon_v5, fused_gdn_fwd_decode_gluon_v6,
+    split_gdn_fwd_decode_gluon_v5,
 )
 import triton
 
@@ -1931,6 +1932,1260 @@ class TestGluonFusedGDNFwdDecodeV2:
         print(f"V1 (Q/K-indexed, batched): {time_v1:.3f} ms")
         print(f"V2 (V-indexed, simple):    {time_v2:.3f} ms")
         print(f"Speedup (v2/v1):           {speedup:.2f}x")
+        print(f"{'='*70}")
+
+
+class TestSplitGDNFwdDecodeV5:
+    """
+    Test suite for split GDN kernel (post-conv input, no conv logic).
+    
+    This kernel takes already conv'd mixed_qkv as input and only performs:
+    1. Split into Q, K, V
+    2. Apply activation
+    3. Delta Rule computation
+    """
+    
+    @pytest.fixture
+    def device(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA device not available")
+        return "cuda"
+    
+    @pytest.fixture
+    def dtype(self):
+        return torch.bfloat16
+    
+    def create_post_conv_inputs(
+        self,
+        batch_size,
+        key_dim,
+        value_dim,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        seqlen,
+        device,
+        dtype,
+    ):
+        """
+        Create test inputs for split GDN kernel.
+        The mixed_qkv here represents post-conv1d results.
+        """
+        assert key_dim == num_heads_qk * head_dim
+        assert value_dim == num_heads_v * head_dim
+        
+        dim = 2 * key_dim + value_dim
+        
+        # This represents the post-conv mixed_qkv tensor
+        mixed_qkv = torch.randn(batch_size, dim, seqlen, device=device, dtype=dtype)
+        
+        # Gating parameters
+        # A_log and dt_bias: shape (num_heads_v,) - one per V head
+        A_log = torch.randn(num_heads_v, device=device, dtype=torch.float32)
+        dt_bias = torch.randn(num_heads_v, device=device, dtype=dtype)
+        
+        # a and b: shape (batch_size * seqlen, num_heads_v) - time-variant gating
+        # Kernel accesses: p_a = a + (bos + 0) * HV + i_hv where HV = num_heads_v
+        a = torch.randn(batch_size * seqlen, num_heads_v, device=device, dtype=dtype)
+        b = torch.randn(batch_size * seqlen, num_heads_v, device=device, dtype=dtype)
+        
+        # SSM state: shape (batch + padding, num_heads_v, head_dim, head_dim)
+        ssm_state = torch.randn(
+            batch_size + 10, num_heads_v, head_dim, head_dim,
+            device=device, dtype=torch.float32
+        )
+        
+        ssm_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        
+        return {
+            "mixed_qkv": mixed_qkv,
+            "A_log": A_log,
+            "a": a,
+            "dt_bias": dt_bias,
+            "b": b,
+            "ssm_state": ssm_state,
+            "ssm_state_indices": ssm_state_indices,
+            "key_dim": key_dim,
+            "value_dim": value_dim,
+            "num_heads_qk": num_heads_qk,
+            "num_heads_v": num_heads_v,
+            "head_dim": head_dim,
+        }
+    
+    def split_gdn_reference(
+        self,
+        mixed_qkv,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        ssm_state,
+        key_dim,
+        value_dim,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        ssm_state_indices=None,
+        scale=None,
+        use_qk_l2norm_in_kernel=True,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    ):
+        """
+        Reference implementation for split GDN (no conv, post-conv input).
+        Uses the fused_sigmoid_gating_delta_rule_update function.
+        """
+        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        
+        batch, dim, seqlen = mixed_qkv.shape
+        
+        # Split mixed_qkv into Q, K, V
+        q = mixed_qkv[:, :key_dim, :]
+        k = mixed_qkv[:, key_dim:2*key_dim, :]
+        v = mixed_qkv[:, 2*key_dim:, :]
+        
+        # Apply silu activation
+        q = q * torch.sigmoid(q)
+        k = k * torch.sigmoid(k)
+        v = v * torch.sigmoid(v)
+        
+        # Reshape
+        q = q.view(batch, seqlen, num_heads_qk, head_dim)
+        k = k.view(batch, seqlen, num_heads_qk, head_dim)
+        v = v.view(batch, seqlen, num_heads_v, head_dim)
+        
+        # Call the delta rule update
+        output = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=ssm_state,
+            initial_state_indices=ssm_state_indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        
+        return output
+    
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    @pytest.mark.parametrize("seqlen", [1])
+    def test_split_gdn_v5_correctness(
+        self,
+        batch_size,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        seqlen,
+        device,
+        dtype,
+    ):
+        """Test correctness of split GDN v5 kernel against reference."""
+        torch.cuda.manual_seed(42)
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, device, dtype
+        )
+        
+        # Clone inputs for separate runs
+        inputs_ref = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        inputs_split = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        
+        # Run reference
+        output_ref = self.split_gdn_reference(**inputs_ref)
+        
+        # Run split kernel
+        output_split = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs_split["mixed_qkv"],
+            A_log=inputs_split["A_log"],
+            a=inputs_split["a"],
+            dt_bias=inputs_split["dt_bias"],
+            b=inputs_split["b"],
+            ssm_state=inputs_split["ssm_state"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            ssm_state_indices=inputs_split["ssm_state_indices"],
+        )
+        
+        # Compare outputs
+        rtol, atol = 1e-2, 5e-2
+        max_diff = (output_split - output_ref).abs().max().item()
+        print(f"\n[batch={batch_size}] Output max diff: {max_diff:.6e}")
+        
+        assert torch.allclose(output_split, output_ref, rtol=rtol, atol=atol), \
+            f"Output mismatch: max diff = {max_diff}"
+        
+        print(f"  ✓ Split GDN v5 correctness test passed (batch={batch_size})")
+    
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    def test_split_gdn_v5_performance(self, batch_size, seqlen, device, dtype):
+        """Benchmark performance of split GDN v5 kernel."""
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, device, dtype
+        )
+        
+        # Warmup for split GDN v5
+        for _ in range(5):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark split GDN v5
+        num_iters = 100
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(num_iters):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        split_time = start_event.elapsed_time(end_event) / num_iters  # ms
+
+        print(f"\n{'='*70}")
+        print(f"Split GDN v5 Performance Benchmark")
+        print(f"Configuration: batch={batch_size}, seqlen={seqlen}")
+        print(f"  num_heads_qk={num_heads_qk}, num_heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Split GDN v5 Time per iteration: {split_time:.4f} ms")
+        print(f"{'='*70}")
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    def test_fused_gdn_v5_performance(self, batch_size, seqlen, device, dtype):
+        """Benchmark performance of fused GDN v5 kernel."""
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        dim = 2 * key_dim + value_dim
+        conv_width = 4
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, device, dtype
+        )
+
+        # Create additional inputs for fused kernel (with conv)
+        conv_state = torch.randn(
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
+        conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
+        conv_bias = torch.randn(dim, device=device, dtype=dtype)
+        conv_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        
+        # Warmup for fused GDN v5
+        for _ in range(5):
+             _ = fused_gdn_fwd_decode_gluon_v6(
+                mixed_qkv=inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+
+        # Benchmark fused GDN v5
+        num_iters = 100
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(num_iters):
+             _ = fused_gdn_fwd_decode_gluon_v6(
+                mixed_qkv=inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        fused_time = start_event.elapsed_time(end_event) / num_iters  # ms
+        
+        print(f"\n{'='*70}")
+        print(f"Fused GDN v5 Performance Benchmark")
+        print(f"Configuration: batch={batch_size}, seqlen={seqlen}")
+        print(f"  num_heads_qk={num_heads_qk}, num_heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Fused GDN v5 Time per iteration: {fused_time:.4f} ms")
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("batch_size", [64])
+    def test_split_gdn_v5_vs_fused_gdn_v5(self, batch_size, device, dtype):
+        """
+        Compare performance of split GDN v5 (no conv) vs fused GDN v5 (with conv).
+        The split version should be faster as it skips conv computation.
+        """
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        dim = 2 * key_dim + value_dim
+        seqlen = 1
+        conv_width = 4
+        
+        # Create inputs for split kernel (post-conv)
+        split_inputs = self.create_post_conv_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, device, dtype
+        )
+        
+        # Create additional inputs for fused kernel (with conv)
+        conv_state = torch.randn(
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
+        conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
+        conv_bias = torch.randn(dim, device=device, dtype=dtype)
+        conv_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        
+        num_iters = 50
+        
+        # Benchmark split kernel
+        for _ in range(3):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=split_inputs["mixed_qkv"],
+                A_log=split_inputs["A_log"],
+                a=split_inputs["a"],
+                dt_bias=split_inputs["dt_bias"],
+                b=split_inputs["b"],
+                ssm_state=split_inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=split_inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_iters):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=split_inputs["mixed_qkv"],
+                A_log=split_inputs["A_log"],
+                a=split_inputs["a"],
+                dt_bias=split_inputs["dt_bias"],
+                b=split_inputs["b"],
+                ssm_state=split_inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=split_inputs["ssm_state_indices"],
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        split_time = start_event.elapsed_time(end_event) / num_iters
+        
+        # Benchmark fused kernel (v1 - which doesn't use sched_barrier)
+        for _ in range(3):
+            _ = fused_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=split_inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=split_inputs["A_log"],
+                a=split_inputs["a"],
+                dt_bias=split_inputs["dt_bias"],
+                b=split_inputs["b"],
+                ssm_state=split_inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=split_inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_iters):
+            _ = fused_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=split_inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=split_inputs["A_log"],
+                a=split_inputs["a"],
+                dt_bias=split_inputs["dt_bias"],
+                b=split_inputs["b"],
+                ssm_state=split_inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=split_inputs["ssm_state_indices"],
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        fused_time = start_event.elapsed_time(end_event) / num_iters
+        
+        speedup = fused_time / split_time
+        
+        print(f"\n[batch={batch_size}] Split: {split_time:.4f}ms | Fused: {fused_time:.4f}ms | Speedup: {speedup:.2f}x")
+
+
+    
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    def test_fused_gdn_performance(self, batch_size, seqlen, device, dtype):
+        """Benchmark performance of fused GDN kernel."""
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        dim = 2 * key_dim + value_dim
+        conv_width = 4
+        
+        # Create inputs
+        inputs = self.create_post_conv_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, device, dtype
+        )
+        
+        conv_state = torch.randn(
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
+        conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
+        conv_bias = torch.randn(dim, device=device, dtype=dtype)
+        conv_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        
+        # Warmup
+        for _ in range(5):
+            _ = fused_gdn_fwd_decode(
+                mixed_qkv=inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        num_iters = 100
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(num_iters):
+            _ = fused_gdn_fwd_decode(
+                mixed_qkv=inputs["mixed_qkv"],
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=conv_bias,
+                conv_state_indices=conv_state_indices,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        fused_time = start_event.elapsed_time(end_event) / num_iters  # ms
+        
+        print(f"\n{'='*70}")
+        print(f"Fused GDN Performance Benchmark")
+        print(f"Configuration: batch={batch_size}, seqlen={seqlen}")
+        print(f"  num_heads_qk={num_heads_qk}, num_heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Time per iteration: {fused_time:.4f} ms")
+        print(f"{'='*70}")
+
+
+class TestSplitGDNPipelined:
+    """Test for the software-pipelined split GDN kernel."""
+    
+    @property
+    def device(self):
+        return "cuda"
+    
+    @property
+    def dtype(self):
+        return torch.bfloat16
+    
+    def create_post_conv_inputs(
+        self,
+        batch_size,
+        key_dim,
+        value_dim,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        seqlen,
+        device,
+        dtype,
+    ):
+        """Create test inputs for split GDN kernel."""
+        assert key_dim == num_heads_qk * head_dim
+        assert value_dim == num_heads_v * head_dim
+        
+        dim = 2 * key_dim + value_dim
+        mixed_qkv = torch.randn(batch_size, dim, seqlen, device=device, dtype=dtype)
+        
+        A_log = torch.randn(num_heads_v, device=device, dtype=torch.float32)
+        dt_bias = torch.randn(num_heads_v, device=device, dtype=dtype)
+        a = torch.randn(batch_size * seqlen, num_heads_v, device=device, dtype=dtype)
+        b = torch.randn(batch_size * seqlen, num_heads_v, device=device, dtype=dtype)
+        
+        ssm_state = torch.randn(
+            batch_size + 10, num_heads_v, head_dim, head_dim,
+            device=device, dtype=torch.float32
+        )
+        ssm_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        
+        return {
+            "mixed_qkv": mixed_qkv,
+            "A_log": A_log,
+            "a": a,
+            "dt_bias": dt_bias,
+            "b": b,
+            "ssm_state": ssm_state,
+            "ssm_state_indices": ssm_state_indices,
+        }
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Test correctness of pipelined kernel against non-pipelined version."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        # Create post-conv inputs
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size,
+            seqlen=seqlen,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        
+        # Clone ssm_state for both tests
+        ssm_state_ref = inputs["ssm_state"].clone()
+        ssm_state_pipelined = inputs["ssm_state"].clone()
+        
+        # Run reference (non-pipelined)
+        output_ref = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            ssm_state=ssm_state_ref,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        # Run pipelined version
+        output_pipelined = split_gdn_fwd_decode_gluon_v5_pipelined(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            ssm_state=ssm_state_pipelined,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        # Compare outputs
+        max_diff = (output_pipelined - output_ref).abs().max().item()
+        mean_diff = (output_pipelined - output_ref).abs().mean().item()
+        
+        print(f"\n{'='*70}")
+        print(f"Pipelined vs Non-pipelined Correctness Test")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        print(f"{'='*70}")
+        
+        assert max_diff < 1e-3, f"Output mismatch: max_diff={max_diff}"
+        
+        # Compare SSM states
+        state_diff = (ssm_state_pipelined - ssm_state_ref).abs().max().item()
+        print(f"  SSM state max_diff={state_diff:.6f}")
+        assert state_diff < 1e-3, f"SSM state mismatch: max_diff={state_diff}"
+        
+        print("  ✓ Pipelined kernel correctness test PASSED!")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Benchmark pipelined vs non-pipelined kernel performance."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size,
+            seqlen=seqlen,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        
+        num_warmup = 10
+        num_iters = 100
+        
+        # Warmup and benchmark non-pipelined
+        for _ in range(num_warmup):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        start.record()
+        for _ in range(num_iters):
+            _ = split_gdn_fwd_decode_gluon_v5(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        end.record()
+        torch.cuda.synchronize()
+        non_pipelined_time = start.elapsed_time(end) / num_iters * 1000  # us
+        
+        # Warmup and benchmark pipelined
+        for _ in range(num_warmup):
+            _ = split_gdn_fwd_decode_gluon_v5_pipelined(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        torch.cuda.synchronize()
+        
+        start.record()
+        for _ in range(num_iters):
+            _ = split_gdn_fwd_decode_gluon_v5_pipelined(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=inputs["ssm_state"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                ssm_state_indices=inputs["ssm_state_indices"],
+            )
+        end.record()
+        torch.cuda.synchronize()
+        pipelined_time = start.elapsed_time(end) / num_iters * 1000  # us
+        
+        speedup = non_pipelined_time / pipelined_time
+        
+        print(f"\n{'='*70}")
+        print(f"Pipelined Performance Benchmark: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Non-pipelined: {non_pipelined_time:.2f} us")
+        print(f"  Pipelined:     {pipelined_time:.2f} us")
+        print(f"  Speedup:       {speedup:.2f}x")
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Test correctness of pipelined v2 (store-compute overlap) kernel."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        ssm_state_ref = inputs["ssm_state"].clone()
+        ssm_state_v2 = inputs["ssm_state"].clone()
+        
+        output_ref = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_ref,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        output_v2 = split_gdn_fwd_decode_gluon_v5_pipelined_v2(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_v2,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        max_diff = (output_v2 - output_ref).abs().max().item()
+        state_diff = (ssm_state_v2 - ssm_state_ref).abs().max().item()
+        
+        print(f"\n{'='*70}")
+        print(f"Pipelined v2 (Store-Compute Overlap) Correctness Test")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  output max_diff={max_diff:.6f}, state max_diff={state_diff:.6f}")
+        print(f"{'='*70}")
+        
+        assert max_diff < 1e-3, f"Output mismatch: max_diff={max_diff}"
+        assert state_diff < 1e-3, f"State mismatch: max_diff={state_diff}"
+        print("  ✓ Pipelined v2 correctness test PASSED!")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Benchmark pipelined v2 (store-compute overlap) vs other versions."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        num_warmup, num_iters = 10, 100
+        
+        def bench(fn):
+            for _ in range(num_warmup):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / num_iters * 1000
+        
+        t_ref = bench(split_gdn_fwd_decode_gluon_v5)
+        t_v1 = bench(split_gdn_fwd_decode_gluon_v5_pipelined)
+        t_v2 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2)
+        
+        print(f"\n{'='*70}")
+        print(f"Pipelined v2 Performance: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Non-pipelined:      {t_ref:.2f} us")
+        print(f"  Pipelined v1:       {t_v1:.2f} us (speedup: {t_ref/t_v1:.2f}x)")
+        print(f"  Pipelined v2:       {t_v2:.2f} us (speedup: {t_ref/t_v2:.2f}x)")
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile64_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Test correctness of pipelined v2 with V-tiling (128x64) kernel."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        ssm_state_ref = inputs["ssm_state"].clone()
+        ssm_state_vtile64 = inputs["ssm_state"].clone()
+        
+        output_ref = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_ref,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        output_vtile64 = split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_vtile64,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        max_diff = (output_vtile64 - output_ref).abs().max().item()
+        state_diff = (ssm_state_vtile64 - ssm_state_ref).abs().max().item()
+        
+        print(f"\n{'='*70}")
+        print(f"Pipelined v2 V-Tiling (128x64) Correctness Test")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  output max_diff={max_diff:.6f}, state max_diff={state_diff:.6f}")
+        print(f"{'='*70}")
+        
+        assert max_diff < 1e-3, f"Output mismatch: max_diff={max_diff}"
+        assert state_diff < 1e-3, f"State mismatch: max_diff={state_diff}"
+        print("  V-Tiling correctness test PASSED!")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile64_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Benchmark pipelined v2 with V-tiling (BV=64) vs other versions."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        num_warmup, num_iters = 10, 100
+        
+        def bench(fn):
+            for _ in range(num_warmup):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / num_iters * 1000
+        
+        t_ref = bench(split_gdn_fwd_decode_gluon_v5)
+        t_v1 = bench(split_gdn_fwd_decode_gluon_v5_pipelined)
+        t_v2 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2)
+        t_vtile64 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64)
+        
+        print(f"\n{'='*70}")
+        print(f"VTile64 Performance: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Non-pipelined (128x128):   {t_ref:.2f} us")
+        print(f"  Pipelined v1 (128x128):    {t_v1:.2f} us (speedup: {t_ref/t_v1:.2f}x)")
+        print(f"  Pipelined v2 (128x128):    {t_v2:.2f} us (speedup: {t_ref/t_v2:.2f}x)")
+        print(f"  VTile64 (128x64, 160 blk): {t_vtile64:.2f} us (speedup: {t_ref/t_vtile64:.2f}x)")
+        print(f"{'='*70}")
+        print(f"  VTile64 vs v2 speedup:     {t_v2/t_vtile64:.2f}x")
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile32_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Test correctness of vtile32 (BV=32, 320 blocks)."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        ssm_state_ref = inputs["ssm_state"].clone()
+        ssm_state_vtile32 = inputs["ssm_state"].clone()
+        
+        output_ref = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_ref,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        output_vtile32 = split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_vtile32,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        max_diff = (output_ref - output_vtile32).abs().max().item()
+        state_diff = (ssm_state_ref - ssm_state_vtile32).abs().max().item()
+        
+        print(f"\n{'='*70}")
+        print(f"VTile32 (BV=32, 320 blocks) Correctness Test")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  output max_diff={max_diff:.6f}, state max_diff={state_diff:.6f}")
+        print(f"{'='*70}")
+        
+        assert max_diff < 1e-3, f"Output mismatch: max_diff={max_diff}"
+        assert state_diff < 1e-3, f"State mismatch: max_diff={state_diff}"
+        print("  VTile32 correctness test PASSED!")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+        (128, 8, 4, 1, 128),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile32_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Benchmark vtile32 (BV=32, 320 blocks) vs vtile64 (BV=64, 160 blocks)."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        num_warmup, num_iters = 10, 1000
+        
+        def bench(fn):
+            for _ in range(num_warmup):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / num_iters * 1000
+        
+        t_ref = bench(split_gdn_fwd_decode_gluon_v5)
+        t_v2 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2)
+        t_vtile64 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64)
+        t_vtile32 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32)
+        
+        print(f"\n{'='*70}")
+        print(f"VTile32 Performance: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Non-pipelined (128x128):    {t_ref:.2f} us")
+        print(f"  Pipelined v2 (128x128):     {t_v2:.2f} us (speedup: {t_ref/t_v2:.2f}x)")
+        print(f"  VTile64 (128x64, 160 blk):  {t_vtile64:.2f} us (speedup: {t_ref/t_vtile64:.2f}x)")
+        print(f"  VTile32 (128x32, 320 blk):  {t_vtile32:.2f} us (speedup: {t_ref/t_vtile32:.2f}x)")
+        print(f"{'='*70}")
+        print(f"  VTile32 vs VTile64 speedup: {t_vtile64/t_vtile32:.2f}x")
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile_inloop_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Test correctness of vtile_inloop (persistent kernel with internal V-tile loop)."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile_inloop,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        ssm_state_ref = inputs["ssm_state"].clone()
+        ssm_state_v3 = inputs["ssm_state"].clone()
+        
+        output_ref = split_gdn_fwd_decode_gluon_v5(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_ref,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        output_v3 = split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile_inloop(
+            mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+            dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=ssm_state_v3,
+            key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim,
+            ssm_state_indices=inputs["ssm_state_indices"],
+        )
+        
+        max_diff = (output_v3 - output_ref).abs().max().item()
+        state_diff = (ssm_state_v3 - ssm_state_ref).abs().max().item()
+        
+        print(f"\n{'='*70}")
+        print(f"VTile InLoop (Persistent + Internal Loop) Correctness Test")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  output max_diff={max_diff:.6f}, state max_diff={state_diff:.6f}")
+        print(f"{'='*70}")
+        
+        assert max_diff < 1e-3, f"Output mismatch: max_diff={max_diff}"
+        assert state_diff < 1e-3, f"State mismatch: max_diff={state_diff}"
+        print("  VTile InLoop correctness test PASSED!")
+    
+    @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
+        (128, 8, 4, 1, 64),
+        (128, 8, 4, 1, 128),
+    ])
+    def test_split_gdn_v5_pipelined_v2_vtile_inloop_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
+        """Benchmark vtile_inloop (persistent + internal loop) vs other versions."""
+        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
+            split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64,
+            split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile_inloop,
+        )
+        
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        
+        inputs = self.create_post_conv_inputs(
+            batch_size=batch_size, seqlen=seqlen, num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v, head_dim=head_dim, key_dim=key_dim,
+            value_dim=value_dim, device=self.device, dtype=self.dtype,
+        )
+        
+        num_warmup, num_iters = 10, 100
+        
+        def bench(fn):
+            for _ in range(num_warmup):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                _ = fn(mixed_qkv=inputs["mixed_qkv"], A_log=inputs["A_log"], a=inputs["a"],
+                    dt_bias=inputs["dt_bias"], b=inputs["b"], ssm_state=inputs["ssm_state"],
+                    key_dim=key_dim, value_dim=value_dim, num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v, head_dim=head_dim,
+                    ssm_state_indices=inputs["ssm_state_indices"])
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / num_iters * 1000
+        
+        t_ref = bench(split_gdn_fwd_decode_gluon_v5)
+        t_v2 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2)
+        t_vtile64 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64)
+        t_vtile_inloop = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile_inloop)
+        
+        print(f"\n{'='*70}")
+        print(f"VTile InLoop Performance: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Non-pipelined (128x128):         {t_ref:.2f} us")
+        print(f"  Pipelined v2 (128x128):          {t_v2:.2f} us (speedup: {t_ref/t_v2:.2f}x)")
+        print(f"  VTile64 (160 blk):               {t_vtile64:.2f} us (speedup: {t_ref/t_vtile64:.2f}x)")
+        print(f"  VTile InLoop (80 blk, internal): {t_vtile_inloop:.2f} us (speedup: {t_ref/t_vtile_inloop:.2f}x)")
+        print(f"{'='*70}")
+        print(f"  VTile InLoop vs VTile64 speedup: {t_vtile64/t_vtile_inloop:.2f}x")
         print(f"{'='*70}")
 
 
