@@ -3017,7 +3017,7 @@ class TestSplitGDNPipelined:
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
         (128, 8, 4, 1, 64),
-        (128, 8, 4, 1, 128),
+        # (128, 8, 4, 1, 128),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile32_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark vtile32 (BV=32, 320 blocks) vs vtile64 (BV=64, 160 blocks)."""
