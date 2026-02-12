@@ -28,6 +28,16 @@ from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
 import triton
 
 
+# =============================================================================
+# Qwen3Next model configuration with Tensor Parallelism
+# =============================================================================
+NUM_HEADS_QK = 16       # Total Q/K heads across all GPUs
+NUM_HEADS_V = 32        # Total V heads across all GPUs
+DEFAULT_TP = 8           # Default tensor parallelism degree
+NUM_HEADS_QK_PER_GPU = NUM_HEADS_QK // DEFAULT_TP  # = 4
+NUM_HEADS_V_PER_GPU = NUM_HEADS_V // DEFAULT_TP    # = 8
+
+
 def gdn_fwd_decode_ref(
     mixed_qkv: torch.Tensor,
     conv_state: torch.Tensor,
@@ -185,8 +195,8 @@ class TestFusedGDNFwdDecode:
         }
     
     @pytest.mark.parametrize("batch_size", [1])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [2])
     @pytest.mark.parametrize("conv_width", [4])
@@ -300,8 +310,8 @@ class TestFusedGDNFwdDecode:
     @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
     def test_decode_throughput(self, batch_size, device, dtype):
         """Test decode throughput with various batch sizes."""
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -476,8 +486,8 @@ class TestFusedGDNFwdDecode:
     def test_different_configs(self, activation, use_qk_l2norm, device, dtype):
         """Test different activation and normalization configurations."""
         batch_size = 16
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -620,8 +630,8 @@ class TestGluonFusedGDNFwdDecode:
         }
     
     @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1])
     @pytest.mark.parametrize("conv_width", [4])
@@ -671,8 +681,8 @@ class TestGluonFusedGDNFwdDecode:
         print(f"✓ Gluon kernel test passed")
     
     @pytest.mark.parametrize("batch_size", [1])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1])
     @pytest.mark.parametrize("conv_width", [4])
@@ -726,8 +736,8 @@ class TestGluonFusedGDNFwdDecode:
         """Benchmark performance of Gluon kernel vs reference implementation."""
         import os
         
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -893,8 +903,8 @@ class TestGluonFusedGDNFwdDecode:
         """
         import os
         
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -1085,8 +1095,8 @@ class TestGluonFusedGDNFwdDecode:
         2. fused_gdn_fwd_decode_gluon (Gluon v1, Q/K-indexed)
         3. fused_gdn_fwd_decode_gluon_v2 (Gluon v2, V-indexed)
         """
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -1312,8 +1322,8 @@ class TestKernelComparison:
     @pytest.mark.parametrize("batch", [1, 4])
     @pytest.mark.parametrize("seqlen", [1, 16])
     @pytest.mark.parametrize("head_dim", [128])
-    @pytest.mark.parametrize("num_heads_v", [8])
-    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
     @pytest.mark.parametrize("conv_width", [4])
     def test_v1_v2_accuracy(
         self,
@@ -1431,8 +1441,8 @@ class TestKernelComparison:
     @pytest.mark.parametrize("batch", [1, 4, 16])
     @pytest.mark.parametrize("seqlen", [1, 16, 64])
     @pytest.mark.parametrize("head_dim", [128])
-    @pytest.mark.parametrize("num_heads_v", [8])
-    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
     def test_v1_v2_performance(
         self,
         batch,
@@ -1647,8 +1657,8 @@ class TestGluonFusedGDNFwdDecodeV2:
         }
     
     @pytest.mark.parametrize("batch_size", [1])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1])
     @pytest.mark.parametrize("conv_width", [4])
@@ -1707,8 +1717,8 @@ class TestGluonFusedGDNFwdDecodeV2:
         print(f"✓ Gluon v2 vs reference test passed (batch={batch_size}, seqlen={seqlen})")
     
     @pytest.mark.parametrize("batch_size", [1, 4])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1, 16])
     @pytest.mark.parametrize("conv_width", [4])
@@ -1759,8 +1769,8 @@ class TestGluonFusedGDNFwdDecodeV2:
         print(f"✓ Gluon v2 vs Triton v2 test passed (batch={batch_size}, seqlen={seqlen})")
     
     @pytest.mark.parametrize("batch_size", [1, 4])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1, 16])
     @pytest.mark.parametrize("conv_width", [4])
@@ -1812,8 +1822,8 @@ class TestGluonFusedGDNFwdDecodeV2:
     @pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
     @pytest.mark.parametrize("seqlen", [1])
     @pytest.mark.parametrize("head_dim", [128])
-    @pytest.mark.parametrize("num_heads_v", [8])
-    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
     def test_gluon_v1_v2_performance(
         self,
         batch,
@@ -2076,8 +2086,8 @@ class TestSplitGDNFwdDecodeV5:
         return output
     
     @pytest.mark.parametrize("batch_size", [64])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("num_heads_qk", [NUM_HEADS_QK_PER_GPU])
+    @pytest.mark.parametrize("num_heads_v", [NUM_HEADS_V_PER_GPU])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("seqlen", [1])
     def test_split_gdn_v5_correctness(
@@ -2137,8 +2147,8 @@ class TestSplitGDNFwdDecodeV5:
     @pytest.mark.parametrize("seqlen", [1])
     def test_split_gdn_v5_performance(self, batch_size, seqlen, device, dtype):
         """Benchmark performance of split GDN v5 kernel."""
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -2204,8 +2214,8 @@ class TestSplitGDNFwdDecodeV5:
     @pytest.mark.parametrize("seqlen", [1])
     def test_fused_gdn_v5_performance(self, batch_size, seqlen, device, dtype):
         """Benchmark performance of fused GDN v5 kernel."""
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -2291,8 +2301,8 @@ class TestSplitGDNFwdDecodeV5:
         Compare performance of split GDN v5 (no conv) vs fused GDN v5 (with conv).
         The split version should be faster as it skips conv computation.
         """
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -2416,8 +2426,8 @@ class TestSplitGDNFwdDecodeV5:
     @pytest.mark.parametrize("seqlen", [1])
     def test_fused_gdn_performance(self, batch_size, seqlen, device, dtype):
         """Benchmark performance of fused GDN kernel."""
-        num_heads_qk = 4
-        num_heads_v = 8
+        num_heads_qk = NUM_HEADS_QK_PER_GPU
+        num_heads_v = NUM_HEADS_V_PER_GPU
         head_dim = 128
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -2550,7 +2560,7 @@ class TestSplitGDNPipelined:
         }
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Test correctness of pipelined kernel against non-pipelined version."""
@@ -2631,7 +2641,7 @@ class TestSplitGDNPipelined:
         print("  ✓ Pipelined kernel correctness test PASSED!")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark pipelined vs non-pipelined kernel performance."""
@@ -2748,7 +2758,7 @@ class TestSplitGDNPipelined:
         print(f"{'='*70}")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Test correctness of pipelined v2 (store-compute overlap) kernel."""
@@ -2799,7 +2809,7 @@ class TestSplitGDNPipelined:
         print("  ✓ Pipelined v2 correctness test PASSED!")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark pipelined v2 (store-compute overlap) vs other versions."""
@@ -2854,7 +2864,7 @@ class TestSplitGDNPipelined:
         print(f"{'='*70}")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile64_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Test correctness of pipelined v2 with V-tiling (128x64) kernel."""
@@ -2905,7 +2915,7 @@ class TestSplitGDNPipelined:
         print("  V-Tiling correctness test PASSED!")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile64_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark pipelined v2 with V-tiling (BV=64) vs other versions."""
@@ -2965,7 +2975,7 @@ class TestSplitGDNPipelined:
         print(f"{'='*70}")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile32_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Test correctness of vtile32 (BV=32, 320 blocks)."""
@@ -3016,13 +3026,14 @@ class TestSplitGDNPipelined:
         print("  VTile32 correctness test PASSED!")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
-        # (128, 8, 4, 1, 128),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
+        # (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 128),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile32_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark vtile32 (BV=32, 320 blocks) vs vtile64 (BV=64, 160 blocks)."""
         from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
             split_gdn_fwd_decode_gluon_v5,
+            split_gdn_fwd_decode_gluon_v5_pipelined,
             split_gdn_fwd_decode_gluon_v5_pipelined_v2,
             split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64,
             split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32,
@@ -3061,6 +3072,7 @@ class TestSplitGDNPipelined:
             return start.elapsed_time(end) / num_iters * 1000
         
         t_ref = bench(split_gdn_fwd_decode_gluon_v5)
+        t_pipelined = bench(split_gdn_fwd_decode_gluon_v5_pipelined)
         t_v2 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2)
         t_vtile64 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile64)
         t_vtile32 = bench(split_gdn_fwd_decode_gluon_v5_pipelined_v2_vtile32)
@@ -3069,6 +3081,7 @@ class TestSplitGDNPipelined:
         print(f"VTile32 Performance: batch={batch_size}, seqlen={seqlen}")
         print(f"{'='*70}")
         print(f"  Non-pipelined (128x128):    {t_ref:.2f} us")
+        print(f"  Pipelined (128x128):        {t_pipelined:.2f} us (speedup: {t_ref/t_pipelined:.2f}x)")
         print(f"  Pipelined v2 (128x128):     {t_v2:.2f} us (speedup: {t_ref/t_v2:.2f}x)")
         print(f"  VTile64 (128x64, 160 blk):  {t_vtile64:.2f} us (speedup: {t_ref/t_vtile64:.2f}x)")
         print(f"  VTile32 (128x32, 320 blk):  {t_vtile32:.2f} us (speedup: {t_ref/t_vtile32:.2f}x)")
@@ -3077,7 +3090,7 @@ class TestSplitGDNPipelined:
         print(f"{'='*70}")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile_inloop_correctness(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Test correctness of vtile_inloop (persistent kernel with internal V-tile loop)."""
@@ -3128,8 +3141,8 @@ class TestSplitGDNPipelined:
         print("  VTile InLoop correctness test PASSED!")
     
     @pytest.mark.parametrize("head_dim,num_heads_v,num_heads_qk,seqlen,batch_size", [
-        (128, 8, 4, 1, 64),
-        (128, 8, 4, 1, 128),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 64),
+        (128, NUM_HEADS_V_PER_GPU, NUM_HEADS_QK_PER_GPU, 1, 128),
     ])
     def test_split_gdn_v5_pipelined_v2_vtile_inloop_performance(self, head_dim, num_heads_v, num_heads_qk, seqlen, batch_size):
         """Benchmark vtile_inloop (persistent + internal loop) vs other versions."""

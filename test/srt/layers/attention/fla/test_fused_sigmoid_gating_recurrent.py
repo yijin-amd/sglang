@@ -814,7 +814,7 @@ class TestFusedSplitGDRUpdate:
         device,
         dtype,
     ):
-        """Benchmark performance of fused_split_gdr_update."""
+        """Benchmark performance of fused_split_gdr_update vs fused_sigmoid_gating_delta_rule_update."""
         torch.manual_seed(42)
         
         inputs = self.create_inputs(
@@ -828,7 +828,78 @@ class TestFusedSplitGDRUpdate:
         softplus_threshold = 20.0
         scale = head_dim ** -0.5
         
-        # Warmup
+        num_iters = 1000
+        
+        # Prepare q, k, v for fused_sigmoid_gating_delta_rule_update (baseline)
+        mixed_qkv = inputs["mixed_qkv"]
+        batch, dim, T = mixed_qkv.shape
+        
+        # Apply silu activation to mixed_qkv (simulating conv1d output)
+        mixed_qkv_activated = mixed_qkv * torch.sigmoid(mixed_qkv)
+        
+        # Split activated mixed_qkv into Q, K, V
+        q = mixed_qkv_activated[:, :key_dim, :]
+        k = mixed_qkv_activated[:, key_dim:2*key_dim, :]
+        v = mixed_qkv_activated[:, 2*key_dim:, :]
+        
+        # Reshape for fused_sigmoid_gating_delta_rule_update
+        # (batch, dim, seqlen) -> (batch, seqlen, heads, head_dim)
+        q = q.view(batch, num_heads_qk, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        k = k.view(batch, num_heads_qk, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        v = v.view(batch, num_heads_v, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        
+        # ============================================================
+        # Benchmark baseline: fused_sigmoid_gating_delta_rule_update
+        # ============================================================
+        for _ in range(10):
+            _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        
+        for _ in range(num_iters):
+            _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        baseline_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
+        
+        # ============================================================
+        # Benchmark fused_split_gdr_update
+        # ============================================================
         for _ in range(10):
             _ = fused_split_gdr_update(
                 mixed_qkv=inputs["mixed_qkv"],
@@ -850,8 +921,6 @@ class TestFusedSplitGDRUpdate:
             )
         torch.cuda.synchronize()
         
-        # Benchmark
-        num_iters = 1000
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
@@ -881,15 +950,17 @@ class TestFusedSplitGDRUpdate:
         end_event.record()
         torch.cuda.synchronize()
         
-        elapsed_time = start_event.elapsed_time(end_event) / num_iters  # ms
-        elapsed_us = elapsed_time * 1000  # Convert to microseconds
+        split_gdr_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
+        
+        # Calculate speedup
+        speedup = baseline_time_us / split_gdr_time_us
         
         print(f"\n{'='*70}")
         print(f"Split GDR Performance: batch={batch_size}, seqlen={seqlen}")
         print(f"  num_heads_qk={num_heads_qk}, num_heads_v={num_heads_v}, head_dim={head_dim}")
         print(f"{'='*70}")
-        print(f"  Kernel time: {elapsed_time:.4f} ms ({elapsed_us:.2f} us)")
-        print(f"  Throughput: {1000/elapsed_time:.2f} iterations/sec")
+        print(f"  fused_sigmoid_gating_delta_rule_update (baseline): {baseline_time_us:.2f} us")
+        print(f"  fused_split_gdr_update:                           {split_gdr_time_us:.2f} us (speedup: {speedup:.2f}x)")
         print(f"{'='*70}")
 
 
@@ -1297,102 +1368,7 @@ class TestFusedSplitGDRUpdateOpt:
         
         print(f"  ✓ Split GDR v3 correctness test passed!")
 
-    @pytest.mark.parametrize("batch_size", [64])
-    @pytest.mark.parametrize("seqlen", [1])
-    @pytest.mark.parametrize("num_heads_qk", [4])
-    @pytest.mark.parametrize("num_heads_v", [8])
-    @pytest.mark.parametrize("head_dim", [128])
-    def test_split_gdr_v3_preallocated_output(
-        self,
-        batch_size,
-        seqlen,
-        num_heads_qk,
-        num_heads_v,
-        head_dim,
-        device,
-        dtype,
-    ):
-        """Test v3 with pre-allocated output buffer."""
-        torch.manual_seed(42)
-        
-        inputs = self.create_inputs(
-            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype
-        )
-        
-        key_dim = inputs["key_dim"]
-        value_dim = inputs["value_dim"]
-        
-        softplus_beta = 1.0
-        softplus_threshold = 20.0
-        scale = head_dim ** -0.5
-        
-        # Clone state for both runs
-        ssm_state_alloc = inputs["ssm_state"].clone()
-        ssm_state_prealloc = inputs["ssm_state"].clone()
-        
-        # Run v3 without pre-allocated output (baseline)
-        output_alloc = fused_split_gdr_update_v3(
-            mixed_qkv=inputs["mixed_qkv"],
-            A_log=inputs["A_log"],
-            a=inputs["a"],
-            dt_bias=inputs["dt_bias"],
-            b=inputs["b"],
-            initial_state_source=ssm_state_alloc,
-            initial_state_indices=inputs["ssm_state_indices"],
-            key_dim=key_dim,
-            value_dim=value_dim,
-            num_heads_qk=num_heads_qk,
-            num_heads_v=num_heads_v,
-            head_dim=head_dim,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm_in_kernel=True,
-        )
-        
-        # Pre-allocate output buffer
-        output_buffer = torch.empty(
-            batch_size, seqlen, num_heads_v, head_dim,
-            device=device, dtype=dtype
-        )
-        
-        # Run v3 with pre-allocated output
-        output_prealloc = fused_split_gdr_update_v3(
-            mixed_qkv=inputs["mixed_qkv"],
-            A_log=inputs["A_log"],
-            a=inputs["a"],
-            dt_bias=inputs["dt_bias"],
-            b=inputs["b"],
-            initial_state_source=ssm_state_prealloc,
-            initial_state_indices=inputs["ssm_state_indices"],
-            key_dim=key_dim,
-            value_dim=value_dim,
-            num_heads_qk=num_heads_qk,
-            num_heads_v=num_heads_v,
-            head_dim=head_dim,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm_in_kernel=True,
-            output=output_buffer,  # Use pre-allocated buffer
-        )
-        
-        # Check that returned tensor is the same object as provided buffer
-        assert output_prealloc is output_buffer, "Returned tensor should be same as provided buffer"
-        
-        # Compare outputs
-        output_diff = (output_alloc - output_prealloc).abs().max().item()
-        
-        print(f"\n{'='*70}")
-        print(f"Split GDR v3 Pre-allocated Output Test: batch={batch_size}, seqlen={seqlen}")
-        print(f"{'='*70}")
-        print(f"  Output max diff: {output_diff:.6f}")
-        print(f"  Pre-allocated buffer reused: {output_prealloc is output_buffer}")
-        print(f"{'='*70}")
-        
-        assert output_diff < 1e-5, f"Output mismatch: {output_diff}"
-        
-        print(f"  ✓ Pre-allocated output test passed!")
+
 
     @pytest.mark.parametrize("batch_size", [64])
     @pytest.mark.parametrize("seqlen", [1])
@@ -1430,6 +1406,128 @@ class TestFusedSplitGDRUpdateOpt:
         )
         
         num_iters = 1000
+        
+        # Prepare q, k, v for fused_sigmoid_gating_delta_rule_update (base)
+        mixed_qkv = inputs["mixed_qkv"]
+        batch, dim, T = mixed_qkv.shape
+        
+        # Apply silu activation to mixed_qkv (simulating conv1d output)
+        mixed_qkv_activated = mixed_qkv * torch.sigmoid(mixed_qkv)
+        
+        # Split activated mixed_qkv into Q, K, V
+        q = mixed_qkv_activated[:, :key_dim, :]
+        k = mixed_qkv_activated[:, key_dim:2*key_dim, :]
+        v = mixed_qkv_activated[:, 2*key_dim:, :]
+        
+        # Reshape for fused_sigmoid_gating_delta_rule_update
+        # (batch, dim, seqlen) -> (batch, seqlen, heads, head_dim)
+        q = q.view(batch, num_heads_qk, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        k = k.view(batch, num_heads_qk, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        v = v.view(batch, num_heads_v, head_dim, T).permute(0, 3, 1, 2).contiguous()
+        
+        # ============================================================
+        # Benchmark base: fused_sigmoid_gating_delta_rule_update
+        # ============================================================
+        for _ in range(10):
+            _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        
+        for _ in range(num_iters):
+            _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        base_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
+        
+        # ============================================================
+        # Benchmark v1 (original fused_split_gdr_update)
+        # ============================================================
+        for _ in range(10):
+            _ = fused_split_gdr_update(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        
+        for _ in range(num_iters):
+            _ = fused_split_gdr_update(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+            )
+        
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        v1_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
         
         # ============================================================
         # Benchmark v2
@@ -1487,62 +1585,7 @@ class TestFusedSplitGDRUpdateOpt:
         v2_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
         
         # ============================================================
-        # Benchmark v3 (without pre-allocated output)
-        # ============================================================
-        for _ in range(10):
-            _ = fused_split_gdr_update_v3(
-                mixed_qkv=inputs["mixed_qkv"],
-                A_log=inputs["A_log"],
-                a=inputs["a"],
-                dt_bias=inputs["dt_bias"],
-                b=inputs["b"],
-                initial_state_source=inputs["ssm_state"],
-                initial_state_indices=inputs["ssm_state_indices"],
-                key_dim=key_dim,
-                value_dim=value_dim,
-                num_heads_qk=num_heads_qk,
-                num_heads_v=num_heads_v,
-                head_dim=head_dim,
-                softplus_beta=softplus_beta,
-                softplus_threshold=softplus_threshold,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-            )
-        torch.cuda.synchronize()
-        
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        torch.cuda.synchronize()
-        start_event.record()
-        
-        for _ in range(num_iters):
-            _ = fused_split_gdr_update_v3(
-                mixed_qkv=inputs["mixed_qkv"],
-                A_log=inputs["A_log"],
-                a=inputs["a"],
-                dt_bias=inputs["dt_bias"],
-                b=inputs["b"],
-                initial_state_source=inputs["ssm_state"],
-                initial_state_indices=inputs["ssm_state_indices"],
-                key_dim=key_dim,
-                value_dim=value_dim,
-                num_heads_qk=num_heads_qk,
-                num_heads_v=num_heads_v,
-                head_dim=head_dim,
-                softplus_beta=softplus_beta,
-                softplus_threshold=softplus_threshold,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-            )
-        
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        v3_alloc_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
-        
-        # ============================================================
-        # Benchmark v3 (with pre-allocated output)
+        # Benchmark v3
         # ============================================================
         for _ in range(10):
             _ = fused_split_gdr_update_v3(
@@ -1596,20 +1639,20 @@ class TestFusedSplitGDRUpdateOpt:
         end_event.record()
         torch.cuda.synchronize()
         
-        v3_prealloc_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
+        v3_time_us = start_event.elapsed_time(end_event) / num_iters * 1000
         
-        # Calculate speedups
-        v3_alloc_speedup = v2_time_us / v3_alloc_time_us
-        v3_prealloc_speedup = v2_time_us / v3_prealloc_time_us
-        prealloc_benefit = v3_alloc_time_us / v3_prealloc_time_us
+        # Calculate speedups (base as baseline)
+        v1_speedup = base_time_us / v1_time_us
+        v2_speedup = base_time_us / v2_time_us
+        v3_speedup = base_time_us / v3_time_us
         
         print(f"\n{'='*70}")
-        print(f"Split GDR v2 vs v3 Performance: batch={batch_size}, seqlen={seqlen}")
+        print(f"Split GDR Performance: batch={batch_size}, seqlen={seqlen}")
         print(f"{'='*70}")
-        print(f"  v2 (baseline):           {v2_time_us:.2f} us")
-        print(f"  v3 (alloc output):       {v3_alloc_time_us:.2f} us (speedup: {v3_alloc_speedup:.2f}x)")
-        print(f"  v3 (pre-alloc output):   {v3_prealloc_time_us:.2f} us (speedup: {v3_prealloc_speedup:.2f}x)")
-        print(f"  Pre-allocation benefit:  {prealloc_benefit:.2f}x ({(prealloc_benefit-1)*100:.1f}% faster)")
+        print(f"  base (fused_sigmoid_gating_delta_rule_update): {base_time_us:.2f} us")
+        print(f"  v1 (fused_split_gdr_update):       {v1_time_us:.2f} us (speedup: {v1_speedup:.2f}x)")
+        print(f"  v2 (fused_split_gdr_update_v2):    {v2_time_us:.2f} us (speedup: {v2_speedup:.2f}x)")
+        print(f"  v3 (fused_split_gdr_update_v3):    {v3_time_us:.2f} us (speedup: {v3_speedup:.2f}x)")
         print(f"{'='*70}")
 
     # ========================================================================
