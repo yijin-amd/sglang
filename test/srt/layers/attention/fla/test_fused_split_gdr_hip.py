@@ -74,6 +74,29 @@ def from_swizzled_layout(state: torch.Tensor) -> torch.Tensor:
     # Make contiguous
     return state.contiguous()
 
+
+def to_vsplit_layout(state: torch.Tensor) -> torch.Tensor:
+    """
+    Convert state from standard (N, HV, K, V) to vsplit (N, HV, V/4, K, 4) layout.
+    
+    Vsplit layout groups 4 contiguous V values together:
+    - Each float4 = 4 V values for one K position
+    - Optimized for the vsplit kernel's [8,8] thread layout
+    """
+    N, HV, K, V = state.shape
+    assert V % 4 == 0, f"V ({V}) must be divisible by 4 for vsplit layout"
+    return state.reshape(N, HV, K, V // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
+
+
+def from_vsplit_layout(state: torch.Tensor) -> torch.Tensor:
+    """
+    Convert state from vsplit (N, HV, V/4, K, 4) to standard (N, HV, K, V) layout.
+    """
+    N, HV, V4, K, four = state.shape
+    assert four == 4, f"Last dimension must be 4, got {four}"
+    V = V4 * 4
+    return state.permute(0, 1, 3, 2, 4).reshape(N, HV, K, V).contiguous()
+
 # ---------------------------------------------------------------------------
 # Compile and load the HIP extension at import time
 # ---------------------------------------------------------------------------
@@ -84,7 +107,7 @@ _HIP_SRC = os.path.join(
     _THIS_DIR,
     "..", "..", "..", "..", "..",  # navigate to sglang/
     "python", "sglang", "srt", "layers", "attention", "fla",
-    "split_gdr_decode.hip",
+    "split_gdr_decode_hip.hip",
 )
 _HIP_SRC = os.path.normpath(_HIP_SRC)
 
@@ -579,6 +602,443 @@ class TestFusedSplitGDRHip:
         print(f"  Triton v3:  {triton_time_us:8.2f} us")
         print(f"  HIP kernel: {hip_time_us:8.2f} us")
         print(f"  Speedup (Triton/HIP): {speedup:.3f}x")
+        print(f"{'='*70}")
+
+
+    # ------------------------------------------------------------------
+    # Correctness test — ksplit2 kernel against torch CPU reference
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_ksplit2_correctness(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Test correctness of ksplit2 HIP kernel against torch CPU reference."""
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype,
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        # ---- Reference: pure PyTorch CPU ----
+        ssm_state_ref = inputs["ssm_state"].clone()
+        output_ref = split_gdr_reference(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_ref,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # ---- ksplit2 kernel under test ----
+        hip_mod = _get_hip_module()
+        ssm_state_hip = inputs["ssm_state"].clone()
+        ssm_state_swizzled = to_swizzled_layout(ssm_state_hip)
+
+        output_hip = hip_mod.fused_split_gdr_update_ksplit2(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b_gate=inputs["b"],
+            initial_state_source=ssm_state_swizzled,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        ssm_state_hip_final = from_swizzled_layout(ssm_state_swizzled)
+
+        output_diff = (output_ref - output_hip).abs().max().item()
+        state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
+
+        print(f"\n{'='*70}")
+        print(f"Split GDR ksplit2 Correctness: batch={batch_size}, seqlen={seqlen}")
+        print(f"  heads_qk={num_heads_qk}, heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Output max diff: {output_diff:.6f}")
+        print(f"  State  max diff: {state_diff:.6f}")
+        print(f"{'='*70}")
+
+        assert output_diff < 5e-3, f"Output diff too large: {output_diff}"
+        assert state_diff < 5e-3, f"State diff too large: {state_diff}"
+        print(f"  PASS — ksplit2 correctness test passed!")
+
+    # ------------------------------------------------------------------
+    # Correctness test — ksplit4 kernel against torch CPU reference
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_ksplit4_correctness(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Test correctness of ksplit4 HIP kernel against torch CPU reference."""
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype,
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        # ---- Reference: pure PyTorch CPU ----
+        ssm_state_ref = inputs["ssm_state"].clone()
+        output_ref = split_gdr_reference(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_ref,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # ---- ksplit4 kernel under test ----
+        hip_mod = _get_hip_module()
+        ssm_state_hip = inputs["ssm_state"].clone()
+        ssm_state_swizzled = to_swizzled_layout(ssm_state_hip)
+
+        output_hip = hip_mod.fused_split_gdr_update_ksplit4(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b_gate=inputs["b"],
+            initial_state_source=ssm_state_swizzled,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        ssm_state_hip_final = from_swizzled_layout(ssm_state_swizzled)
+
+        output_diff = (output_ref - output_hip).abs().max().item()
+        state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
+
+        print(f"\n{'='*70}")
+        print(f"Split GDR ksplit4 Correctness: batch={batch_size}, seqlen={seqlen}")
+        print(f"  heads_qk={num_heads_qk}, heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Output max diff: {output_diff:.6f}")
+        print(f"  State  max diff: {state_diff:.6f}")
+        print(f"{'='*70}")
+
+        assert output_diff < 5e-3, f"Output diff too large: {output_diff}"
+        assert state_diff < 5e-3, f"State diff too large: {state_diff}"
+        print(f"  PASS — ksplit4 correctness test passed!")
+
+    # ------------------------------------------------------------------
+    # Correctness test — vsplit kernel against torch CPU reference
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_vsplit_correctness(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Test correctness of vsplit HIP kernel against torch CPU reference."""
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype,
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        # ---- Reference: pure PyTorch CPU ----
+        ssm_state_ref = inputs["ssm_state"].clone()
+        output_ref = split_gdr_reference(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_ref,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # ---- vsplit kernel under test ----
+        hip_mod = _get_hip_module()
+        ssm_state_hip = inputs["ssm_state"].clone()
+
+        output_hip = hip_mod.fused_split_gdr_update_vsplit(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b_gate=inputs["b"],
+            initial_state_source=ssm_state_hip,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        ssm_state_hip_final = ssm_state_hip
+
+        output_diff = (output_ref - output_hip).abs().max().item()
+        state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
+
+        print(f"\n{'='*70}")
+        print(f"Split GDR vsplit Correctness: batch={batch_size}, seqlen={seqlen}")
+        print(f"  heads_qk={num_heads_qk}, heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Output max diff: {output_diff:.6f}")
+        print(f"  State  max diff: {state_diff:.6f}")
+        print(f"{'='*70}")
+
+        assert output_diff < 5e-3, f"Output diff too large: {output_diff}"
+        assert state_diff < 5e-3, f"State diff too large: {state_diff}"
+        print(f"  PASS — vsplit correctness test passed!")
+
+    # ------------------------------------------------------------------
+    # Performance test — compare all kernels
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_all_kernels_performance(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Benchmark all four kernels: Triton v3, origin HIP, ksplit2, ksplit4."""
+        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_split_gdr_update_v3,
+        )
+
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype,
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        num_warmup = 10
+        num_iters = 1000
+
+        hip_mod = _get_hip_module()
+        ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"])
+
+        # Helper: benchmark a callable that takes a cloned state
+        def _benchmark(run_fn, use_swizzled=False):
+            template = ssm_state_swizzled_template if use_swizzled else inputs["ssm_state"]
+            for _ in range(num_warmup):
+                run_fn(template.clone())
+            torch.cuda.synchronize()
+
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_evt.record()
+            for _ in range(num_iters):
+                run_fn(template.clone())
+            end_evt.record()
+            torch.cuda.synchronize()
+            return start_evt.elapsed_time(end_evt) / num_iters * 1000  # us
+
+        common_args = dict(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        hip_common = dict(
+            **{k: v for k, v in common_args.items() if k != "a"},
+            a=inputs["a"],
+            b_gate=inputs["b"],
+        )
+
+        # 1) Triton v3
+        triton_us = _benchmark(
+            lambda st: fused_split_gdr_update_v3(
+                **common_args,
+                b=inputs["b"],
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=False,
+        )
+
+        # 2) Origin HIP
+        origin_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 3) ksplit2
+        ksplit2_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_ksplit2(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 4) ksplit4
+        ksplit4_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_ksplit4(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 5) vsplit (uses standard [N,HV,K,V] layout, same as other kernels)
+        vsplit_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_vsplit(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=False,
+        )
+
+        # ============================================================
+        # Report
+        # ============================================================
+        baseline = triton_us
+        print(f"\n{'='*70}")
+        print(f"Split GDR ALL Kernels Performance Comparison")
+        print(f"  batch={batch_size}, seqlen={seqlen}")
+        print(f"  heads_qk={num_heads_qk}, heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"  warmup={num_warmup}, iters={num_iters}")
+        print(f"{'='*70}")
+        print(f"  {'Kernel':<20s} {'Time (us)':>10s} {'vs Triton':>10s}")
+        print(f"  {'-'*20} {'-'*10} {'-'*10}")
+        print(f"  {'Triton v3':<20s} {triton_us:10.2f} {'1.000x':>10s}")
+        print(f"  {'Origin HIP':<20s} {origin_us:10.2f} {baseline/origin_us:9.3f}x")
+        print(f"  {'ksplit2':<20s} {ksplit2_us:10.2f} {baseline/ksplit2_us:9.3f}x")
+        print(f"  {'ksplit4':<20s} {ksplit4_us:10.2f} {baseline/ksplit4_us:9.3f}x")
+        print(f"  {'vsplit':<20s} {vsplit_us:10.2f} {baseline/vsplit_us:9.3f}x")
         print(f"{'='*70}")
 
 

@@ -1215,6 +1215,286 @@ def fused_split_gdr_update_v3(
 
 
 # =============================================================================
+# v4 kernel with bilinear output decomposition:
+# 1. Keep v3 optimizations (loop-invariant code motion, rsqrt, softplus, tl.sigmoid)
+# 2. Compute output from previous state without waiting for state write-back:
+#      o_t = decay * (h_{t-1}^T q_t) + v_hat_t * (k_t^T q_t)
+#    where:
+#      v_hat_t = beta_t * (v_t - decay * (h_{t-1}^T k_t))
+# 3. Preserve the original state update semantics:
+#      h_t = decay * h_{t-1} + k_t v_hat_t^T
+# =============================================================================
+
+def get_autotune_config_v4():
+    if is_cuda():
+        return [triton.Config({'BV': 8}, num_stages=3, num_warps=1)]
+    else:
+        return [triton.Config({'BV': 64}, num_stages=1, num_warps=4)]
+
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.autotune(
+    configs=get_autotune_config_v4(),
+    key=['K', 'V'],
+)
+@triton.jit(do_not_specialize=["T"])
+def fused_split_gdr_update_kernel_v4(
+    mixed_qkv,
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    b,
+    o,
+    h0_source,
+    h0_indices,
+    cu_seqlens,
+    scale,
+    T,
+    key_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    stride_x_batch: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_seq: tl.constexpr,
+    stride_o_batch: tl.constexpr,
+    stride_o_seq: tl.constexpr,
+    stride_o_head: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+
+    GROUP_SIZE: tl.constexpr = HV // H
+    i_h = i_hv // GROUP_SIZE
+
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        T_local = eos - bos
+        batch_idx = 0
+        token_start = bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        batch_idx = i_n
+        token_start = 0
+        T_local = T
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    q_dim_start = i_h * K
+    k_dim_start = key_dim + i_h * K
+    v_dim_start = 2 * key_dim + i_hv * V
+
+    p_A_log = A_log + i_hv
+    p_dt_bias = dt_bias + i_hv
+
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+    neg_exp_A_log = -tl.exp(b_A_log)
+    inv_softplus_beta = 1.0 / softplus_beta
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        idx = tl.load(h0_indices + i_n)
+        if idx >= 0:
+            p_h0 = (
+                h0_source
+                + idx * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    base_ptr = mixed_qkv + batch_idx * stride_x_batch + token_start * stride_x_seq
+
+    q_base = base_ptr + q_dim_start * stride_x_dim
+    k_base = base_ptr + k_dim_start * stride_x_dim
+    v_base = base_ptr + v_dim_start * stride_x_dim
+
+    p_q = q_base + o_k * stride_x_dim
+    p_k = k_base + o_k * stride_x_dim
+    p_v = v_base + o_v * stride_x_dim
+
+    p_a = a + bos * HV + i_hv
+    p_b = b + bos * HV + i_hv
+
+    p_o = o + i_n * stride_o_batch + i_hv * stride_o_head + o_v * stride_o_dim
+
+    for _ in range(0, T_local):
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
+        b_a = tl.load(p_a).to(tl.float32)
+        b_b = tl.load(p_b).to(tl.float32)
+
+        x = b_a + b_dt_bias
+        beta_x = softplus_beta * x
+        softplus_x = tl.where(
+            beta_x <= softplus_threshold,
+            inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
+            x,
+        )
+        b_g = neg_exp_A_log * softplus_x
+        decay = tl.exp(b_g)
+        b_beta = tl.sigmoid(b_b)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+
+        b_q = b_q * scale
+
+        # Projections on previous state
+        hk_proj = tl.sum(b_h * b_k[:, None], 0)
+        hq_proj = tl.sum(b_h * b_q[:, None], 0)
+        kq_dot = tl.sum(b_k * b_q)
+
+        # v_hat = beta * (v - decay * (h^T k))
+        b_v = (b_v - decay * hk_proj) * b_beta
+
+        # Output from bilinear decomposition (no dependency on h write-back)
+        b_o = decay * hq_proj + b_v * kq_dot
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        # Preserve original state transition
+        b_h = decay * b_h + b_k[:, None] * b_v[None, :]
+
+        p_q += stride_x_seq
+        p_k += stride_x_seq
+        p_v += stride_x_seq
+        p_a += HV
+        p_b += HV
+        p_o += stride_o_seq
+
+    if USE_INITIAL_STATE:
+        idx = tl.load(h0_indices + i_n)
+        if idx >= 0:
+            p_h0 = (
+                h0_source
+                + idx * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+
+
+@input_guard
+def fused_split_gdr_update_v4(
+    mixed_qkv: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    key_dim: int,
+    value_dim: int,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_dim: int,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+):
+    if mixed_qkv.dim() == 2:
+        mixed_qkv = mixed_qkv.unsqueeze(0)
+
+    batch, dim, seqlen = mixed_qkv.shape
+
+    H = num_heads_qk
+    HV = num_heads_v
+    K = head_dim
+    V = head_dim
+
+    T = seqlen
+    B = batch
+    N = batch if cu_seqlens is None else len(cu_seqlens) - 1
+
+    BK = triton.next_power_of_2(K)
+    NK = triton.cdiv(K, BK)
+    assert NK == 1, "NK > 1 is not supported yet"
+
+    if scale is None:
+        scale = K ** -0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    if output is None:
+        o = mixed_qkv.new_empty(B, T, HV, V)
+    else:
+        expected_shape = (B, T, HV, V)
+        assert output.shape == expected_shape, (
+            f"Output shape mismatch: expected {expected_shape}, got {output.shape}"
+        )
+        o = output
+
+    grid = lambda META: (NK, triton.cdiv(V, META['BV']), N * HV)
+
+    fused_split_gdr_update_kernel_v4[grid](
+        mixed_qkv=mixed_qkv,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        b=b,
+        o=o,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        T=T,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        stride_x_batch=mixed_qkv.stride(0),
+        stride_x_dim=mixed_qkv.stride(1),
+        stride_x_seq=mixed_qkv.stride(2),
+        stride_o_batch=o.stride(0),
+        stride_o_seq=o.stride(1),
+        stride_o_head=o.stride(2),
+        stride_o_dim=o.stride(3),
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+    )
+    return o
+
+
+# =============================================================================
 # v3_seqlen1: Specialized kernel for seqlen=1 (decode) scenario
 #
 # Optimizations over v3:

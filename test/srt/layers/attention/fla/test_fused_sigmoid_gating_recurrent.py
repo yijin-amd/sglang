@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_split_gdr_update,
     fused_split_gdr_update_v2,
     fused_split_gdr_update_v3,
+    fused_split_gdr_update_v4,
     fused_split_gdr_update_v3_seqlen1,
 )
 
@@ -1850,6 +1851,227 @@ class TestFusedSplitGDRUpdateOpt:
         print(f"{'='*70}")
         print(f"  v3 (general):      {v3_time_us:.2f} us")
         print(f"  v3_seqlen1:        {seqlen1_time_us:.2f} us (speedup: {speedup:.2f}x, {(speedup-1)*100:+.1f}%)")
+        print(f"{'='*70}")
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1, 4])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_v4_correctness(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Test v4 bilinear-output decomposition against v3."""
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        ssm_state_v3 = inputs["ssm_state"].clone()
+        output_v3 = fused_split_gdr_update_v3(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_v3,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        ssm_state_v4 = inputs["ssm_state"].clone()
+        output_v4 = fused_split_gdr_update_v4(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_v4,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        output_diff = (output_v3 - output_v4).abs().max().item()
+        state_diff = (ssm_state_v3 - ssm_state_v4).abs().max().item()
+
+        print(f"\n{'='*70}")
+        print(f"v4 Correctness Test: batch={batch_size}, seqlen={seqlen}")
+        print(f"{'='*70}")
+        print(f"  Output max diff: {output_diff:.6f}")
+        print(f"  State max diff:  {state_diff:.6f}")
+
+        # Reordered arithmetic introduces tiny rounding differences.
+        assert output_diff < 1e-3, f"Output diff too large: {output_diff}"
+        assert state_diff < 1e-3, f"State diff too large: {state_diff}"
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("num_heads_qk", [4])
+    @pytest.mark.parametrize("num_heads_v", [8])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_v4_performance(
+        self,
+        batch_size,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Benchmark v3 vs v4 on decode-shaped workload (qwen3next)."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for performance benchmark")
+
+        torch.manual_seed(42)
+        seqlen = 1
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        output_v3 = torch.empty(batch_size, seqlen, num_heads_v, head_dim, device=device, dtype=dtype)
+        output_v4 = torch.empty(batch_size, seqlen, num_heads_v, head_dim, device=device, dtype=dtype)
+
+        num_iters = 1000
+
+        for _ in range(10):
+            fused_split_gdr_update_v3(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+                output=output_v3,
+            )
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(num_iters):
+            fused_split_gdr_update_v3(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+                output=output_v3,
+            )
+        end.record()
+        torch.cuda.synchronize()
+        v3_time_us = start.elapsed_time(end) / num_iters * 1000
+
+        for _ in range(10):
+            fused_split_gdr_update_v4(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+                output=output_v4,
+            )
+        torch.cuda.synchronize()
+
+        start.record()
+        for _ in range(num_iters):
+            fused_split_gdr_update_v4(
+                mixed_qkv=inputs["mixed_qkv"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                initial_state_source=inputs["ssm_state"],
+                initial_state_indices=inputs["ssm_state_indices"],
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                scale=scale,
+                use_qk_l2norm_in_kernel=True,
+                output=output_v4,
+            )
+        end.record()
+        torch.cuda.synchronize()
+        v4_time_us = start.elapsed_time(end) / num_iters * 1000
+
+        speedup = v3_time_us / v4_time_us
+
+        print(f"\n{'='*70}")
+        print(f"v3 vs v4 Performance: batch={batch_size}, seqlen=1")
+        print(f"{'='*70}")
+        print(f"  v3: {v3_time_us:.2f} us")
+        print(f"  v4: {v4_time_us:.2f} us (speedup: {speedup:.2f}x, {(speedup - 1) * 100:+.1f}%)")
         print(f"{'='*70}")
 
 
