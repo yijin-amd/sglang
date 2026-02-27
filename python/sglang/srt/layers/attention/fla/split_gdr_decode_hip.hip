@@ -490,8 +490,11 @@ void fused_split_gdr_update_kernel_ksplit2(
 
     const int lane = threadIdx.x;
 
-    const int v_idx   = lane >> 1;
-    const int k_split = lane & 1;
+    // Remap lanes so each half-wave handles one K half:
+    // lanes [0..31]  -> k_split=0 (K front half)
+    // lanes [32..63] -> k_split=1 (K back half)
+    const int v_idx   = lane & (BV_OUT - 1);
+    const int k_split = lane >> 5;
     const int v_col   = i_v * BV_OUT + v_idx;
     const bool valid_v = (v_col < V_dim);
     const int k_start = k_split * BK_HALF;
@@ -601,9 +604,9 @@ void fused_split_gdr_update_kernel_ksplit2(
                     k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
                 }
             }
-            dot_partial += __shfl_xor(dot_partial, 1, 64);
+            dot_partial += __shfl_xor(dot_partial, 32, 64);
             if constexpr (USE_QK_L2NORM) {
-                k_sq += __shfl_xor(k_sq, 1, 64);
+                k_sq += __shfl_xor(k_sq, 32, 64);
                 k_inv_norm = rsqrtf(k_sq + 1e-6f);
             }
             v_local -= dot_partial * exp_g * k_inv_norm;
@@ -656,10 +659,10 @@ void fused_split_gdr_update_kernel_ksplit2(
                     q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
                 }
             }
-            out_partial += __shfl_xor(out_partial, 1, 64);
+            out_partial += __shfl_xor(out_partial, 32, 64);
             float q_inv_norm = 1.0f;
             if constexpr (USE_QK_L2NORM) {
-                q_sq += __shfl_xor(q_sq, 1, 64);
+                q_sq += __shfl_xor(q_sq, 32, 64);
                 q_inv_norm = rsqrtf(q_sq + 1e-6f);
             }
             float o_local = out_partial * q_inv_norm * scale;
@@ -750,8 +753,13 @@ void fused_split_gdr_update_kernel_ksplit4(
     const int i_h  = i_hv / (HV / H);
     const int lane = threadIdx.x;
 
-    const int v_idx   = lane >> 2;
-    const int k_split = lane & 3;
+    // Remap lanes so each 16-lane group handles one K quarter:
+    // lanes [0..15]   -> k_split=0
+    // lanes [16..31]  -> k_split=1
+    // lanes [32..47]  -> k_split=2
+    // lanes [48..63]  -> k_split=3
+    const int v_idx   = lane & (BV_OUT - 1);
+    const int k_split = lane >> 4;
     const int v_col   = i_v * BV_OUT + v_idx;
     const bool valid_v = (v_col < V_dim);
     const int k_start = k_split * BK_QTR;
@@ -856,11 +864,11 @@ void fused_split_gdr_update_kernel_ksplit4(
                     k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
                 }
             }
-            dot_partial += __shfl_xor(dot_partial, 1, 64);
-            dot_partial += __shfl_xor(dot_partial, 2, 64);
+            dot_partial += __shfl_xor(dot_partial, 16, 64);
+            dot_partial += __shfl_xor(dot_partial, 32, 64);
             if constexpr (USE_QK_L2NORM) {
-                k_sq += __shfl_xor(k_sq, 1, 64);
-                k_sq += __shfl_xor(k_sq, 2, 64);
+                k_sq += __shfl_xor(k_sq, 16, 64);
+                k_sq += __shfl_xor(k_sq, 32, 64);
                 k_inv_norm = rsqrtf(k_sq + 1e-6f);
             }
             v_local -= dot_partial * exp_g * k_inv_norm;
@@ -914,12 +922,12 @@ void fused_split_gdr_update_kernel_ksplit4(
                     q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
                 }
             }
-            out_partial += __shfl_xor(out_partial, 1, 64);
-            out_partial += __shfl_xor(out_partial, 2, 64);
+            out_partial += __shfl_xor(out_partial, 16, 64);
+            out_partial += __shfl_xor(out_partial, 32, 64);
             float q_inv_norm = 1.0f;
             if constexpr (USE_QK_L2NORM) {
-                q_sq += __shfl_xor(q_sq, 1, 64);
-                q_sq += __shfl_xor(q_sq, 2, 64);
+                q_sq += __shfl_xor(q_sq, 16, 64);
+                q_sq += __shfl_xor(q_sq, 32, 64);
                 q_inv_norm = rsqrtf(q_sq + 1e-6f);
             }
             float o_local = out_partial * q_inv_norm * scale;
@@ -1022,12 +1030,14 @@ void fused_split_gdr_update_kernel_vsplit(
     const int k_thread = lane & (K_THREADS - 1);
     const int v_thread = lane >> 3;
 
-    const int k_start     = k_thread * K_PER_THREAD;
+    // Interleaved-K mapping:
+    // thread 0 -> k={0,8,16,...}, thread 1 -> k={1,9,17,...}, ...
+    // This makes cross-thread K accesses contiguous for a fixed i.
     const int v_group     = i_v * V_THREADS + v_thread;
     const int v_col_start = v_group * V_PER_THREAD;
     const bool valid_v    = (v_col_start + V_PER_THREAD - 1 < V_dim);
 
-    // h_vec[i] = (v0, v1, v2, v3) for K position k_start+i
+    // h_vec[i] = (v0, v1, v2, v3) for K position (k_thread + i * K_THREADS)
     float4 h_vec[K_PER_THREAD];
     #pragma unroll
     for (int i = 0; i < K_PER_THREAD; i++) {
@@ -1047,7 +1057,7 @@ void fused_split_gdr_update_kernel_vsplit(
             );
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
-                const int k = k_start + i;
+                const int k = k_thread + i * K_THREADS;
                 if (k < K) {
                     h_vec[i] = h0_base[static_cast<int64_t>(k) * V4 + v_group];
                 }
@@ -1127,7 +1137,8 @@ void fused_split_gdr_update_kernel_vsplit(
             float k_sq = 0.0f;
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
-                const float kv = smem[k_start + i];
+                const int k = k_thread + i * K_THREADS;
+                const float kv = smem[k];
                 d0 = fmaf(h_vec[i].x, kv, d0);
                 d1 = fmaf(h_vec[i].y, kv, d1);
                 d2 = fmaf(h_vec[i].z, kv, d2);
@@ -1161,7 +1172,8 @@ void fused_split_gdr_update_kernel_vsplit(
             const float kv2 = k_inv_norm * v2, kv3 = k_inv_norm * v3;
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
-                const float kval = smem[k_start + i];
+                const int k = k_thread + i * K_THREADS;
+                const float kval = smem[k];
                 h_vec[i].x = fmaf(h_vec[i].x, exp_g, kval * kv0);
                 h_vec[i].y = fmaf(h_vec[i].y, exp_g, kval * kv1);
                 h_vec[i].z = fmaf(h_vec[i].z, exp_g, kval * kv2);
@@ -1192,7 +1204,8 @@ void fused_split_gdr_update_kernel_vsplit(
             float q_sq = 0.0f;
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
-                const float qv = smem[k_start + i];
+                const int k = k_thread + i * K_THREADS;
+                const float qv = smem[k];
                 o0 = fmaf(h_vec[i].x, qv, o0);
                 o1 = fmaf(h_vec[i].y, qv, o1);
                 o2 = fmaf(h_vec[i].z, qv, o2);
@@ -1238,7 +1251,7 @@ void fused_split_gdr_update_kernel_vsplit(
             );
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
-                const int k = k_start + i;
+                const int k = k_thread + i * K_THREADS;
                 if (k < K) {
                     h0_base[static_cast<int64_t>(k) * V4 + v_group] = h_vec[i];
                 }
