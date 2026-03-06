@@ -88,6 +88,38 @@ __device__ __forceinline__ void load_bf16x2(
     }
 }
 
+// Padded variant: stores at smem[padded_idx] to avoid LDS bank conflicts
+// when multiple k_splits read from offsets that are multiples of 32 (= NUM_BANKS).
+// Padding inserts 1 float gap every CHUNK elements, so k_split N starts at
+// N*(CHUNK+1) instead of N*CHUNK, mapping to different banks.
+template <int CHUNK>
+__device__ __forceinline__ int lds_padded_idx(int idx)
+{
+    return idx + idx / CHUNK;
+}
+
+template <int CHUNK>
+__device__ __forceinline__ void load_bf16x2_padded(
+    float* __restrict__ smem,
+    const __hip_bfloat16* __restrict__ src,
+    int base, int K, int BK)
+{
+    const int p0 = lds_padded_idx<CHUNK>(base);
+    const int p1 = lds_padded_idx<CHUNK>(base + 1);
+    if (base + 1 < K) {
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(src + base);
+        const __hip_bfloat16* v = reinterpret_cast<const __hip_bfloat16*>(&packed);
+        smem[p0] = static_cast<float>(v[0]);
+        smem[p1] = static_cast<float>(v[1]);
+    } else if (base < K) {
+        smem[p0] = static_cast<float>(src[base]);
+        if (base + 1 < BK) smem[p1] = 0.0f;
+    } else {
+        if (base < BK)     smem[p0] = 0.0f;
+        if (base + 1 < BK) smem[p1] = 0.0f;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel: fused_split_gdr_update_kernel
 // ---------------------------------------------------------------------------
@@ -745,6 +777,9 @@ void fused_split_gdr_update_kernel_ksplit4(
     constexpr int BK_QTR  = BK / 4;
     constexpr int BK4_QTR = BK_QTR / 4;
     constexpr int BV_OUT  = BV / 4;
+    constexpr int SMEM_PAD = (BK_QTR == 32) ? 1 : 0;
+    constexpr int SMEM_STRIDE = BK_QTR + SMEM_PAD;
+    constexpr int SMEM_SIZE = SMEM_STRIDE * 4;
 
     const int i_v  = blockIdx.y;
     const int i_nh = blockIdx.z;
@@ -753,18 +788,14 @@ void fused_split_gdr_update_kernel_ksplit4(
     const int i_h  = i_hv / (HV / H);
     const int lane = threadIdx.x;
 
-    // Remap lanes so each 16-lane group handles one K quarter:
-    // lanes [0..15]   -> k_split=0
-    // lanes [16..31]  -> k_split=1
-    // lanes [32..47]  -> k_split=2
-    // lanes [48..63]  -> k_split=3
     const int v_idx   = lane & (BV_OUT - 1);
     const int k_split = lane >> 4;
     const int v_col   = i_v * BV_OUT + v_idx;
     const bool valid_v = (v_col < V_dim);
-    const int k_start = k_split * BK_QTR;
+    const int k_start_logical = k_split * BK_QTR;
+    const int k_start = k_split * SMEM_STRIDE;
 
-    __shared__ float smem[BK];
+    __shared__ float smem[SMEM_SIZE];
 
     float4 h_vec[BK4_QTR];
     #pragma unroll
@@ -781,7 +812,7 @@ void fused_split_gdr_update_kernel_ksplit4(
                 + static_cast<int64_t>(idx) * HV * K4 * V_dim * 4
                 + static_cast<int64_t>(i_hv) * K4 * V_dim * 4
             );
-            const int kg_start = k_start / 4;
+            const int kg_start = k_start_logical / 4;
             #pragma unroll
             for (int i = 0; i < BK4_QTR; i++) {
                 const int kg = kg_start + i;
@@ -811,34 +842,47 @@ void fused_split_gdr_update_kernel_ksplit4(
           + static_cast<int64_t>(i_hv) * stride_o_head;
 
     const bool use_vec2 = (stride_x_dim == 1);
+    const int safe_v_col = valid_v ? v_col : 0;
 
     for (int t = 0; t < T; t++) {
         const __hip_bfloat16* x_t =
             x_base + static_cast<int64_t>(t) * stride_x_seq;
 
+        // Issue V and gating loads unconditionally BEFORE K cooperative load.
+        // Unconditional V load (safe_v_col) avoids exec masking, letting the
+        // compiler defer s_waitcnt so these overlap with K's HBM latency.
+        const __hip_bfloat16 v_raw =
+            x_t[static_cast<int64_t>(v_dim_off + safe_v_col) * stride_x_dim];
+        const __hip_bfloat16 a_raw = p_a[static_cast<int64_t>(t) * HV];
+        const __hip_bfloat16 b_raw = p_b[static_cast<int64_t>(t) * HV];
+
         if (use_vec2) {
             const int base = 2 * lane;
             if (base < BK) {
-                load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_QTR>(smem, x_t + k_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                }
             }
         } else {
             for (int i = lane; i < BK; i += BV) {
-                smem[i] = (i < K)
+                const float val = (i < K)
                     ? static_cast<float>(
                           x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim])
                     : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_QTR] = val;
+                } else {
+                    smem[i] = val;
+                }
             }
         }
         __syncthreads();
 
-        float v_local = 0.0f;
-        if (valid_v) {
-            v_local = static_cast<float>(
-                x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim]);
-        }
-
-        const float a_t = static_cast<float>(p_a[static_cast<int64_t>(t) * HV]);
-        const float b_t = static_cast<float>(p_b[static_cast<int64_t>(t) * HV]);
+        float v_local = valid_v ? static_cast<float>(v_raw) : 0.0f;
+        const float a_t = static_cast<float>(a_raw);
+        const float b_t = static_cast<float>(b_raw);
 
         const float sp  = hip_softplus(
             a_t + b_dt_bias, softplus_beta, inv_softplus_beta, softplus_threshold);
@@ -847,8 +891,8 @@ void fused_split_gdr_update_kernel_ksplit4(
         const float beta  = hip_sigmoid(b_t);
 
         // Phase 1: Fused K-L2-norm + Delta dot (on UN-DECAYED h_vec)
-        //   dot(h*exp_g, k) == exp_g * dot(h, k), so we skip the
-        //   separate decay pass and fold it into the scalar factor.
+        //   Cache K values in registers so Phase 2 can reuse without LDS re-read.
+        float4 k_cache[BK4_QTR];
         float k_inv_norm = 1.0f;
         {
             float dot_partial = 0.0f;
@@ -858,6 +902,7 @@ void fused_split_gdr_update_kernel_ksplit4(
                 const int k0 = k_start + i * 4;
                 const float s0 = smem[k0], s1 = smem[k0 + 1];
                 const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                k_cache[i] = make_float4(s0, s1, s2, s3);
                 dot_partial += h_vec[i].x * s0 + h_vec[i].y * s1
                              + h_vec[i].z * s2 + h_vec[i].w * s3;
                 if constexpr (USE_QK_L2NORM) {
@@ -876,17 +921,15 @@ void fused_split_gdr_update_kernel_ksplit4(
 
         v_local *= beta;
 
-        // Phase 2: Fused Decay + State update
-        //   h = h * exp_g + k * (k_inv_norm * v)
+        // Phase 2: Fused Decay + State update (reuse cached K, no LDS re-read)
         {
             const float kv = k_inv_norm * v_local;
             #pragma unroll
             for (int i = 0; i < BK4_QTR; i++) {
-                const int k0 = k_start + i * 4;
-                h_vec[i].x = h_vec[i].x * exp_g + smem[k0]     * kv;
-                h_vec[i].y = h_vec[i].y * exp_g + smem[k0 + 1] * kv;
-                h_vec[i].z = h_vec[i].z * exp_g + smem[k0 + 2] * kv;
-                h_vec[i].w = h_vec[i].w * exp_g + smem[k0 + 3] * kv;
+                h_vec[i].x = h_vec[i].x * exp_g + k_cache[i].x * kv;
+                h_vec[i].y = h_vec[i].y * exp_g + k_cache[i].y * kv;
+                h_vec[i].z = h_vec[i].z * exp_g + k_cache[i].z * kv;
+                h_vec[i].w = h_vec[i].w * exp_g + k_cache[i].w * kv;
             }
         }
 
@@ -895,14 +938,23 @@ void fused_split_gdr_update_kernel_ksplit4(
         if (use_vec2) {
             const int base = 2 * lane;
             if (base < BK) {
-                load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_QTR>(smem, x_t + q_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                }
             }
         } else {
             for (int i = lane; i < BK; i += BV) {
-                smem[i] = (i < K)
+                const float val = (i < K)
                     ? static_cast<float>(
                           x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim])
                     : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_QTR] = val;
+                } else {
+                    smem[i] = val;
+                }
             }
         }
         __syncthreads();
@@ -949,7 +1001,7 @@ void fused_split_gdr_update_kernel_ksplit4(
                 + static_cast<int64_t>(idx) * HV * K4 * V_dim * 4
                 + static_cast<int64_t>(i_hv) * K4 * V_dim * 4
             );
-            const int kg_start = k_start / 4;
+            const int kg_start = k_start_logical / 4;
             #pragma unroll
             for (int i = 0; i < BK4_QTR; i++) {
                 const int kg = kg_start + i;
@@ -962,16 +1014,890 @@ void fused_split_gdr_update_kernel_ksplit4(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel: fused_split_gdr_update_kernel_ksplit8
+//
+// K-split=8: 8 threads cooperate on K reduction, each handling BK/8 K
+// elements.  Thread layout is row-major (V first, then K):
+//   v_idx   = lane & 7     (8 V threads)
+//   k_split = lane >> 3    (8 K threads)
+// Threads 0, 8, 16, 24, 32, 40, 48, 56 reduce the same V column.
+//
+// Each block computes BK x (BV/8) state elements.  Grid y-dimension is
+// doubled vs ksplit4: cdiv(V, BV/8).
+//
+// Grid:  (1, cdiv(V, BV/8), B * HV)
+// Block: BV threads = 1 wavefront
+// State layout: SWIZZLED (N_states, HV, K/4, V, 4)
+// ---------------------------------------------------------------------------
+
+template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
+__global__ __launch_bounds__(BV)
+void fused_split_gdr_update_kernel_ksplit8(
+    const __hip_bfloat16* __restrict__ mixed_qkv,
+    const float*          __restrict__ A_log,
+    const __hip_bfloat16* __restrict__ a,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    float                             softplus_beta,
+    float                             softplus_threshold,
+    const __hip_bfloat16* __restrict__ b_gate,
+    __hip_bfloat16*       __restrict__ o,
+    float*                __restrict__ h0_source,
+    const int32_t*        __restrict__ h0_indices,
+    int T,
+    int key_dim,
+    int value_dim,
+    int64_t stride_x_batch,
+    int64_t stride_x_dim,
+    int64_t stride_x_seq,
+    int64_t stride_o_batch,
+    int64_t stride_o_seq,
+    int64_t stride_o_head,
+    int64_t stride_o_dim,
+    int B,
+    int H,
+    int HV,
+    int K,
+    int V_dim,
+    float scale
+) {
+    static_assert(BK % 32 == 0, "BK must be divisible by 32 for K_SPLIT=8");
+
+    constexpr int BK_OCT  = BK / 8;
+    constexpr int BK4_OCT = BK_OCT / 4;
+    constexpr int BV_OUT  = BV / 8;
+    constexpr int SMEM_PAD = (BK_OCT >= 8) ? 1 : 0;
+    constexpr int SMEM_STRIDE = BK_OCT + SMEM_PAD;
+    constexpr int SMEM_SIZE = SMEM_STRIDE * 8;
+
+    const int i_v  = blockIdx.y;
+    const int i_nh = blockIdx.z;
+    const int i_n  = i_nh / HV;
+    const int i_hv = i_nh % HV;
+    const int i_h  = i_hv / (HV / H);
+    const int lane = threadIdx.x;
+
+    const int v_idx   = lane & (BV_OUT - 1);
+    const int k_split = lane >> 3;
+    const int v_col   = i_v * BV_OUT + v_idx;
+    const bool valid_v = (v_col < V_dim);
+    const int k_start_logical = k_split * BK_OCT;
+    const int k_start = k_split * SMEM_STRIDE;
+
+    __shared__ float smem[SMEM_SIZE];
+
+    float4 h_vec[BK4_OCT];
+    #pragma unroll
+    for (int i = 0; i < BK4_OCT; i++) {
+        h_vec[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    if constexpr (USE_INITIAL_STATE) {
+        const int32_t idx = h0_indices[i_n];
+        if (idx >= 0 && valid_v) {
+            const int K4 = K / 4;
+            const float4* h0_base = reinterpret_cast<const float4*>(
+                h0_source
+                + static_cast<int64_t>(idx) * HV * K4 * V_dim * 4
+                + static_cast<int64_t>(i_hv) * K4 * V_dim * 4
+            );
+            const int kg_start = k_start_logical / 4;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                const int kg = kg_start + i;
+                if (kg < K4) {
+                    h_vec[i] = h0_base[kg * V_dim + v_col];
+                }
+            }
+        }
+    }
+
+    const float neg_exp_A_log     = -expf(A_log[i_hv]);
+    const float b_dt_bias         = static_cast<float>(dt_bias[i_hv]);
+    const float inv_softplus_beta = 1.0f / softplus_beta;
+
+    const int q_dim_off = i_h  * K;
+    const int k_dim_off = key_dim + i_h * K;
+    const int v_dim_off = 2 * key_dim + i_hv * V_dim;
+
+    const __hip_bfloat16* x_base =
+        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
+    const __hip_bfloat16* p_a =
+        a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    const __hip_bfloat16* p_b =
+        b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    __hip_bfloat16* p_o =
+        o + static_cast<int64_t>(i_n) * stride_o_batch
+          + static_cast<int64_t>(i_hv) * stride_o_head;
+
+    const bool use_vec2 = (stride_x_dim == 1);
+
+    for (int t = 0; t < T; t++) {
+        const __hip_bfloat16* x_t =
+            x_base + static_cast<int64_t>(t) * stride_x_seq;
+
+        // Load K into smem
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_OCT>(smem, x_t + k_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_OCT] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        float v_local = 0.0f;
+        if (valid_v) {
+            v_local = static_cast<float>(
+                x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim]);
+        }
+
+        const float a_t = static_cast<float>(p_a[static_cast<int64_t>(t) * HV]);
+        const float b_t = static_cast<float>(p_b[static_cast<int64_t>(t) * HV]);
+
+        const float sp  = hip_softplus(
+            a_t + b_dt_bias, softplus_beta, inv_softplus_beta, softplus_threshold);
+        const float g     = neg_exp_A_log * sp;
+        const float exp_g = expf(g);
+        const float beta  = hip_sigmoid(b_t);
+
+        // Phase 1: K-L2-norm + Delta dot, cache K in registers
+        float4 k_cache[BK4_OCT];
+        float k_inv_norm = 1.0f;
+        {
+            float dot_partial = 0.0f;
+            float k_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                const int k0 = k_start + i * 4;
+                const float s0 = smem[k0], s1 = smem[k0 + 1];
+                const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                k_cache[i] = make_float4(s0, s1, s2, s3);
+                dot_partial += h_vec[i].x * s0 + h_vec[i].y * s1
+                             + h_vec[i].z * s2 + h_vec[i].w * s3;
+                if constexpr (USE_QK_L2NORM) {
+                    k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                }
+            }
+            // 8-way K reduction across threads with stride 8
+            dot_partial += __shfl_xor(dot_partial, 8, 64);
+            dot_partial += __shfl_xor(dot_partial, 16, 64);
+            dot_partial += __shfl_xor(dot_partial, 32, 64);
+            if constexpr (USE_QK_L2NORM) {
+                k_sq += __shfl_xor(k_sq, 8, 64);
+                k_sq += __shfl_xor(k_sq, 16, 64);
+                k_sq += __shfl_xor(k_sq, 32, 64);
+                k_inv_norm = rsqrtf(k_sq + 1e-6f);
+            }
+            v_local -= dot_partial * exp_g * k_inv_norm;
+        }
+
+        v_local *= beta;
+
+        // Phase 2: Decay + State update using k_cache
+        {
+            const float kv = k_inv_norm * v_local;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                h_vec[i].x = h_vec[i].x * exp_g + k_cache[i].x * kv;
+                h_vec[i].y = h_vec[i].y * exp_g + k_cache[i].y * kv;
+                h_vec[i].z = h_vec[i].z * exp_g + k_cache[i].z * kv;
+                h_vec[i].w = h_vec[i].w * exp_g + k_cache[i].w * kv;
+            }
+        }
+
+        // Load Q into smem
+        __syncthreads();
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_OCT>(smem, x_t + q_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_OCT] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: Q-L2-norm + Output dot, 8-way K reduction
+        {
+            float out_partial = 0.0f;
+            float q_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                const int k0 = k_start + i * 4;
+                const float s0 = smem[k0], s1 = smem[k0 + 1];
+                const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                out_partial += h_vec[i].x * s0 + h_vec[i].y * s1
+                             + h_vec[i].z * s2 + h_vec[i].w * s3;
+                if constexpr (USE_QK_L2NORM) {
+                    q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                }
+            }
+            out_partial += __shfl_xor(out_partial, 8, 64);
+            out_partial += __shfl_xor(out_partial, 16, 64);
+            out_partial += __shfl_xor(out_partial, 32, 64);
+            float q_inv_norm = 1.0f;
+            if constexpr (USE_QK_L2NORM) {
+                q_sq += __shfl_xor(q_sq, 8, 64);
+                q_sq += __shfl_xor(q_sq, 16, 64);
+                q_sq += __shfl_xor(q_sq, 32, 64);
+                q_inv_norm = rsqrtf(q_sq + 1e-6f);
+            }
+            float o_local = out_partial * q_inv_norm * scale;
+
+            if (k_split == 0 && valid_v) {
+                p_o[static_cast<int64_t>(t) * stride_o_seq
+                    + static_cast<int64_t>(v_col) * stride_o_dim] =
+                    static_cast<__hip_bfloat16>(o_local);
+            }
+        }
+    }
+
+    if constexpr (USE_INITIAL_STATE) {
+        const int32_t idx = h0_indices[i_n];
+        if (idx >= 0 && valid_v) {
+            const int K4 = K / 4;
+            float4* h0_base = reinterpret_cast<float4*>(
+                h0_source
+                + static_cast<int64_t>(idx) * HV * K4 * V_dim * 4
+                + static_cast<int64_t>(i_hv) * K4 * V_dim * 4
+            );
+            const int kg_start = k_start_logical / 4;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                const int kg = kg_start + i;
+                if (kg < K4) {
+                    h0_base[kg * V_dim + v_col] = h_vec[i];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_split_gdr_update_kernel_ksplit4_hfuse
+//
+// Multi-head fused variant of ksplit4.  When HV > H (GQA), multiple V-heads
+// share the same QK head.  This kernel loads K and Q once per timestep,
+// caches K in registers (k_cache) and Q in smem, then iterates over
+// HPB = HV/H v-heads reusing both.
+//
+// Grid:  (1, cdiv(V, BV/4), B * H)       ← note: H, not HV
+// Block: BV threads = 1 wavefront
+// State layout: SWIZZLED (N_states, HV, K/4, V, 4)
+// ---------------------------------------------------------------------------
+
+template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
+__global__ __launch_bounds__(BV)
+void fused_split_gdr_update_kernel_ksplit4_hfuse(
+    const __hip_bfloat16* __restrict__ mixed_qkv,
+    const float*          __restrict__ A_log,
+    const __hip_bfloat16* __restrict__ a,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    float                             softplus_beta,
+    float                             softplus_threshold,
+    const __hip_bfloat16* __restrict__ b_gate,
+    __hip_bfloat16*       __restrict__ o,
+    float*                __restrict__ h0_source,
+    const int32_t*        __restrict__ h0_indices,
+    int T,
+    int key_dim,
+    int value_dim,
+    int64_t stride_x_batch,
+    int64_t stride_x_dim,
+    int64_t stride_x_seq,
+    int64_t stride_o_batch,
+    int64_t stride_o_seq,
+    int64_t stride_o_head,
+    int64_t stride_o_dim,
+    int B,
+    int H,
+    int HV,
+    int K,
+    int V_dim,
+    float scale
+) {
+    static_assert(BK % 4 == 0, "BK must be divisible by 4");
+    static_assert(BK >= 16, "BK must be >= 16 for K_SPLIT=4");
+
+    constexpr int BK_QTR  = BK / 4;
+    constexpr int BK4_QTR = BK_QTR / 4;
+    constexpr int BV_OUT  = BV / 4;
+    constexpr int SMEM_PAD = (BK_QTR == 32) ? 1 : 0;
+    constexpr int SMEM_STRIDE = BK_QTR + SMEM_PAD;
+    constexpr int SMEM_SIZE = SMEM_STRIDE * 4;
+
+    const int i_v  = blockIdx.y;
+    const int i_nh = blockIdx.z;
+    const int i_n  = i_nh / H;
+    const int i_h  = i_nh % H;
+    const int HPB  = HV / H;
+    const int lane = threadIdx.x;
+
+    const int v_idx   = lane & (BV_OUT - 1);
+    const int k_split = lane >> 4;
+    const int v_col   = i_v * BV_OUT + v_idx;
+    const bool valid_v = (v_col < V_dim);
+    const int k_start_logical = k_split * BK_QTR;
+    const int k_start = k_split * SMEM_STRIDE;
+
+    __shared__ float smem[SMEM_SIZE];
+
+    const int q_dim_off = i_h * K;
+    const int k_dim_off = key_dim + i_h * K;
+    const __hip_bfloat16* x_base =
+        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
+    const bool use_vec2 = (stride_x_dim == 1);
+    const float inv_softplus_beta = 1.0f / softplus_beta;
+
+    const int K4 = K / 4;
+    const int kg_start = k_start_logical / 4;
+    const int32_t h0_idx = USE_INITIAL_STATE ? h0_indices[i_n] : -1;
+
+    for (int t = 0; t < T; t++) {
+        const __hip_bfloat16* x_t =
+            x_base + static_cast<int64_t>(t) * stride_x_seq;
+
+        // ---- Load K into smem (once per timestep) ----
+        if (t > 0) __syncthreads();
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_QTR>(smem, x_t + k_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_QTR] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- Cache K in registers, compute k_inv_norm (shared across heads) ----
+        float4 k_cache[BK4_QTR];
+        float k_inv_norm = 1.0f;
+        {
+            float k_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BK4_QTR; i++) {
+                const int k0 = k_start + i * 4;
+                const float s0 = smem[k0], s1 = smem[k0 + 1];
+                const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                k_cache[i] = make_float4(s0, s1, s2, s3);
+                if constexpr (USE_QK_L2NORM) {
+                    k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                }
+            }
+            if constexpr (USE_QK_L2NORM) {
+                k_sq += __shfl_xor(k_sq, 16, 64);
+                k_sq += __shfl_xor(k_sq, 32, 64);
+                k_inv_norm = rsqrtf(k_sq + 1e-6f);
+            }
+        }
+
+        // ---- Load Q into smem (once per timestep, overwrites K) ----
+        __syncthreads();
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_QTR>(smem, x_t + q_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_QTR] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- Process each v-head using k_cache (registers) and Q (smem) ----
+        for (int hh = 0; hh < HPB; hh++) {
+            const int i_hv = i_h * HPB + hh;
+
+            const float neg_exp_A_log = -expf(A_log[i_hv]);
+            const float b_dt_bias     = static_cast<float>(dt_bias[i_hv]);
+            const int v_dim_off       = 2 * key_dim + i_hv * V_dim;
+
+            // Load state for this v-head
+            float4 h_vec[BK4_QTR];
+            #pragma unroll
+            for (int i = 0; i < BK4_QTR; i++) {
+                h_vec[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            if constexpr (USE_INITIAL_STATE) {
+                if (h0_idx >= 0 && valid_v) {
+                    const float4* h0_base = reinterpret_cast<const float4*>(
+                        h0_source
+                        + static_cast<int64_t>(h0_idx) * HV * K4 * V_dim * 4
+                        + static_cast<int64_t>(i_hv)   * K4 * V_dim * 4
+                    );
+                    #pragma unroll
+                    for (int i = 0; i < BK4_QTR; i++) {
+                        const int kg = kg_start + i;
+                        if (kg < K4) {
+                            h_vec[i] = h0_base[kg * V_dim + v_col];
+                        }
+                    }
+                }
+            }
+
+            // Per-head scalars
+            const __hip_bfloat16* p_a = a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
+            const __hip_bfloat16* p_b = b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
+            const float a_t = static_cast<float>(p_a[static_cast<int64_t>(t) * HV]);
+            const float b_t = static_cast<float>(p_b[static_cast<int64_t>(t) * HV]);
+
+            float v_local = 0.0f;
+            if (valid_v) {
+                v_local = static_cast<float>(
+                    x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim]);
+            }
+
+            const float sp  = hip_softplus(
+                a_t + b_dt_bias, softplus_beta, inv_softplus_beta, softplus_threshold);
+            const float g     = neg_exp_A_log * sp;
+            const float exp_g = expf(g);
+            const float beta  = hip_sigmoid(b_t);
+
+            // Phase 1: dot(h_vec, k_cache)
+            {
+                float dot_partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < BK4_QTR; i++) {
+                    dot_partial += h_vec[i].x * k_cache[i].x
+                                + h_vec[i].y * k_cache[i].y
+                                + h_vec[i].z * k_cache[i].z
+                                + h_vec[i].w * k_cache[i].w;
+                }
+                dot_partial += __shfl_xor(dot_partial, 16, 64);
+                dot_partial += __shfl_xor(dot_partial, 32, 64);
+                v_local -= dot_partial * exp_g * k_inv_norm;
+            }
+
+            v_local *= beta;
+
+            // Phase 2: Decay + State update using k_cache
+            {
+                const float kv = k_inv_norm * v_local;
+                #pragma unroll
+                for (int i = 0; i < BK4_QTR; i++) {
+                    h_vec[i].x = h_vec[i].x * exp_g + k_cache[i].x * kv;
+                    h_vec[i].y = h_vec[i].y * exp_g + k_cache[i].y * kv;
+                    h_vec[i].z = h_vec[i].z * exp_g + k_cache[i].z * kv;
+                    h_vec[i].w = h_vec[i].w * exp_g + k_cache[i].w * kv;
+                }
+            }
+
+            // Phase 3: dot(h_vec, Q from smem) → output
+            {
+                float out_partial = 0.0f;
+                float q_sq = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < BK4_QTR; i++) {
+                    const int k0 = k_start + i * 4;
+                    const float s0 = smem[k0], s1 = smem[k0 + 1];
+                    const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                    out_partial += h_vec[i].x * s0 + h_vec[i].y * s1
+                                 + h_vec[i].z * s2 + h_vec[i].w * s3;
+                    if constexpr (USE_QK_L2NORM) {
+                        q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                    }
+                }
+                out_partial += __shfl_xor(out_partial, 16, 64);
+                out_partial += __shfl_xor(out_partial, 32, 64);
+                float q_inv_norm = 1.0f;
+                if constexpr (USE_QK_L2NORM) {
+                    q_sq += __shfl_xor(q_sq, 16, 64);
+                    q_sq += __shfl_xor(q_sq, 32, 64);
+                    q_inv_norm = rsqrtf(q_sq + 1e-6f);
+                }
+                float o_local = out_partial * q_inv_norm * scale;
+
+                __hip_bfloat16* p_o = o + static_cast<int64_t>(i_n) * stride_o_batch
+                                        + static_cast<int64_t>(i_hv) * stride_o_head;
+                if (k_split == 0 && valid_v) {
+                    p_o[static_cast<int64_t>(t) * stride_o_seq
+                        + static_cast<int64_t>(v_col) * stride_o_dim] =
+                        static_cast<__hip_bfloat16>(o_local);
+                }
+            }
+
+            // Store updated state for this v-head
+            if constexpr (USE_INITIAL_STATE) {
+                if (h0_idx >= 0 && valid_v) {
+                    float4* h0_base = reinterpret_cast<float4*>(
+                        h0_source
+                        + static_cast<int64_t>(h0_idx) * HV * K4 * V_dim * 4
+                        + static_cast<int64_t>(i_hv)   * K4 * V_dim * 4
+                    );
+                    #pragma unroll
+                    for (int i = 0; i < BK4_QTR; i++) {
+                        const int kg = kg_start + i;
+                        if (kg < K4) {
+                            h0_base[kg * V_dim + v_col] = h_vec[i];
+                        }
+                    }
+                }
+            }
+        } // end head loop
+    } // end timestep loop
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_split_gdr_update_kernel_ksplit8_hfuse
+//
+// Multi-head fused variant of ksplit8.  When HV > H (GQA), multiple V-heads
+// share the same QK head.  This kernel loads K and Q once per timestep,
+// caches K in registers (k_cache) and Q in smem, then iterates over
+// HPB = HV/H v-heads reusing both.
+//
+// Grid:  (1, cdiv(V, BV/8), B * H)       <- note: H, not HV
+// Block: BV threads = 1 wavefront
+// State layout: SWIZZLED (N_states, HV, K/4, V, 4)
+// ---------------------------------------------------------------------------
+
+template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
+__global__ __launch_bounds__(BV)
+void fused_split_gdr_update_kernel_ksplit8_hfuse(
+    const __hip_bfloat16* __restrict__ mixed_qkv,
+    const float*          __restrict__ A_log,
+    const __hip_bfloat16* __restrict__ a,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    float                             softplus_beta,
+    float                             softplus_threshold,
+    const __hip_bfloat16* __restrict__ b_gate,
+    __hip_bfloat16*       __restrict__ o,
+    float*                __restrict__ h0_source,
+    const int32_t*        __restrict__ h0_indices,
+    int T,
+    int key_dim,
+    int value_dim,
+    int64_t stride_x_batch,
+    int64_t stride_x_dim,
+    int64_t stride_x_seq,
+    int64_t stride_o_batch,
+    int64_t stride_o_seq,
+    int64_t stride_o_head,
+    int64_t stride_o_dim,
+    int B,
+    int H,
+    int HV,
+    int K,
+    int V_dim,
+    float scale
+) {
+    static_assert(BK % 32 == 0, "BK must be divisible by 32 for K_SPLIT=8");
+
+    constexpr int BK_OCT  = BK / 8;
+    constexpr int BK4_OCT = BK_OCT / 4;
+    constexpr int BV_OUT  = BV / 8;
+    constexpr int SMEM_PAD = (BK_OCT >= 8) ? 1 : 0;
+    constexpr int SMEM_STRIDE = BK_OCT + SMEM_PAD;
+    constexpr int SMEM_SIZE = SMEM_STRIDE * 8;
+
+    const int i_v  = blockIdx.y;
+    const int i_nh = blockIdx.z;
+    const int i_n  = i_nh / H;
+    const int i_h  = i_nh % H;
+    const int HPB  = HV / H;
+    const int lane = threadIdx.x;
+
+    const int v_idx   = lane & (BV_OUT - 1);
+    const int k_split = lane >> 3;
+    const int v_col   = i_v * BV_OUT + v_idx;
+    const bool valid_v = (v_col < V_dim);
+    const int k_start_logical = k_split * BK_OCT;
+    const int k_start = k_split * SMEM_STRIDE;
+
+    __shared__ float smem[SMEM_SIZE];
+
+    const int q_dim_off = i_h * K;
+    const int k_dim_off = key_dim + i_h * K;
+    const __hip_bfloat16* x_base =
+        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
+    const bool use_vec2 = (stride_x_dim == 1);
+    const float inv_softplus_beta = 1.0f / softplus_beta;
+
+    const int K4 = K / 4;
+    const int kg_start = k_start_logical / 4;
+    const int32_t h0_idx = USE_INITIAL_STATE ? h0_indices[i_n] : -1;
+
+    for (int t = 0; t < T; t++) {
+        const __hip_bfloat16* x_t =
+            x_base + static_cast<int64_t>(t) * stride_x_seq;
+
+        // ---- Load K into smem (once per timestep) ----
+        if (t > 0) __syncthreads();
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_OCT>(smem, x_t + k_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_OCT] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- Cache K in registers, compute k_inv_norm (shared across heads) ----
+        float4 k_cache[BK4_OCT];
+        float k_inv_norm = 1.0f;
+        {
+            float k_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                const int k0 = k_start + i * 4;
+                const float s0 = smem[k0], s1 = smem[k0 + 1];
+                const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                k_cache[i] = make_float4(s0, s1, s2, s3);
+                if constexpr (USE_QK_L2NORM) {
+                    k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                }
+            }
+            if constexpr (USE_QK_L2NORM) {
+                k_sq += __shfl_xor(k_sq, 8, 64);
+                k_sq += __shfl_xor(k_sq, 16, 64);
+                k_sq += __shfl_xor(k_sq, 32, 64);
+                k_inv_norm = rsqrtf(k_sq + 1e-6f);
+            }
+        }
+
+        // ---- Load Q into smem (once per timestep, overwrites K) ----
+        __syncthreads();
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if (base < BK) {
+                if constexpr (SMEM_PAD) {
+                    load_bf16x2_padded<BK_OCT>(smem, x_t + q_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                }
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float val = (i < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim])
+                    : 0.0f;
+                if constexpr (SMEM_PAD) {
+                    smem[i + i / BK_OCT] = val;
+                } else {
+                    smem[i] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- Process each v-head using k_cache (registers) and Q (smem) ----
+        for (int hh = 0; hh < HPB; hh++) {
+            const int i_hv = i_h * HPB + hh;
+
+            const float neg_exp_A_log = -expf(A_log[i_hv]);
+            const float b_dt_bias     = static_cast<float>(dt_bias[i_hv]);
+            const int v_dim_off       = 2 * key_dim + i_hv * V_dim;
+
+            float4 h_vec[BK4_OCT];
+            #pragma unroll
+            for (int i = 0; i < BK4_OCT; i++) {
+                h_vec[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            if constexpr (USE_INITIAL_STATE) {
+                if (h0_idx >= 0 && valid_v) {
+                    const float4* h0_base = reinterpret_cast<const float4*>(
+                        h0_source
+                        + static_cast<int64_t>(h0_idx) * HV * K4 * V_dim * 4
+                        + static_cast<int64_t>(i_hv)   * K4 * V_dim * 4
+                    );
+                    #pragma unroll
+                    for (int i = 0; i < BK4_OCT; i++) {
+                        const int kg = kg_start + i;
+                        if (kg < K4) {
+                            h_vec[i] = h0_base[kg * V_dim + v_col];
+                        }
+                    }
+                }
+            }
+
+            const __hip_bfloat16* p_a = a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
+            const __hip_bfloat16* p_b = b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
+            const float a_t = static_cast<float>(p_a[static_cast<int64_t>(t) * HV]);
+            const float b_t = static_cast<float>(p_b[static_cast<int64_t>(t) * HV]);
+
+            float v_local = 0.0f;
+            if (valid_v) {
+                v_local = static_cast<float>(
+                    x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim]);
+            }
+
+            const float sp  = hip_softplus(
+                a_t + b_dt_bias, softplus_beta, inv_softplus_beta, softplus_threshold);
+            const float g     = neg_exp_A_log * sp;
+            const float exp_g = expf(g);
+            const float beta  = hip_sigmoid(b_t);
+
+            // Phase 1: dot(h_vec, k_cache) with 8-way reduction
+            {
+                float dot_partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < BK4_OCT; i++) {
+                    dot_partial += h_vec[i].x * k_cache[i].x
+                                + h_vec[i].y * k_cache[i].y
+                                + h_vec[i].z * k_cache[i].z
+                                + h_vec[i].w * k_cache[i].w;
+                }
+                dot_partial += __shfl_xor(dot_partial, 8, 64);
+                dot_partial += __shfl_xor(dot_partial, 16, 64);
+                dot_partial += __shfl_xor(dot_partial, 32, 64);
+                v_local -= dot_partial * exp_g * k_inv_norm;
+            }
+
+            v_local *= beta;
+
+            // Phase 2: Decay + State update using k_cache
+            {
+                const float kv = k_inv_norm * v_local;
+                #pragma unroll
+                for (int i = 0; i < BK4_OCT; i++) {
+                    h_vec[i].x = h_vec[i].x * exp_g + k_cache[i].x * kv;
+                    h_vec[i].y = h_vec[i].y * exp_g + k_cache[i].y * kv;
+                    h_vec[i].z = h_vec[i].z * exp_g + k_cache[i].z * kv;
+                    h_vec[i].w = h_vec[i].w * exp_g + k_cache[i].w * kv;
+                }
+            }
+
+            // Phase 3: dot(h_vec, Q from smem) -> output, 8-way reduction
+            {
+                float out_partial = 0.0f;
+                float q_sq = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < BK4_OCT; i++) {
+                    const int k0 = k_start + i * 4;
+                    const float s0 = smem[k0], s1 = smem[k0 + 1];
+                    const float s2 = smem[k0 + 2], s3 = smem[k0 + 3];
+                    out_partial += h_vec[i].x * s0 + h_vec[i].y * s1
+                                 + h_vec[i].z * s2 + h_vec[i].w * s3;
+                    if constexpr (USE_QK_L2NORM) {
+                        q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                    }
+                }
+                out_partial += __shfl_xor(out_partial, 8, 64);
+                out_partial += __shfl_xor(out_partial, 16, 64);
+                out_partial += __shfl_xor(out_partial, 32, 64);
+                float q_inv_norm = 1.0f;
+                if constexpr (USE_QK_L2NORM) {
+                    q_sq += __shfl_xor(q_sq, 8, 64);
+                    q_sq += __shfl_xor(q_sq, 16, 64);
+                    q_sq += __shfl_xor(q_sq, 32, 64);
+                    q_inv_norm = rsqrtf(q_sq + 1e-6f);
+                }
+                float o_local = out_partial * q_inv_norm * scale;
+
+                __hip_bfloat16* p_o = o + static_cast<int64_t>(i_n) * stride_o_batch
+                                        + static_cast<int64_t>(i_hv) * stride_o_head;
+                if (k_split == 0 && valid_v) {
+                    p_o[static_cast<int64_t>(t) * stride_o_seq
+                        + static_cast<int64_t>(v_col) * stride_o_dim] =
+                        static_cast<__hip_bfloat16>(o_local);
+                }
+            }
+
+            // Store updated state for this v-head
+            if constexpr (USE_INITIAL_STATE) {
+                if (h0_idx >= 0 && valid_v) {
+                    float4* h0_base = reinterpret_cast<float4*>(
+                        h0_source
+                        + static_cast<int64_t>(h0_idx) * HV * K4 * V_dim * 4
+                        + static_cast<int64_t>(i_hv)   * K4 * V_dim * 4
+                    );
+                    #pragma unroll
+                    for (int i = 0; i < BK4_OCT; i++) {
+                        const int kg = kg_start + i;
+                        if (kg < K4) {
+                            h0_base[kg * V_dim + v_col] = h_vec[i];
+                        }
+                    }
+                }
+            }
+        } // end head loop
+    } // end timestep loop
+}
+
+// ---------------------------------------------------------------------------
 // Kernel: fused_split_gdr_update_kernel_vsplit
 //
 // V-split: each thread handles 4 contiguous V columns and BK/8 K elements.
 //   Thread layout: 8 K-threads x 8 V-threads = 64 threads (1 wavefront)
-//     k_thread = lane & 7   (0..7)
+//     lane 0-7   -> (k=0..7, same v_thread)
+//     lane 8-15  -> (k=0..7, next v_thread), etc.
+//     k_thread = lane & 7    (0..7)
 //     v_thread = lane >> 3   (0..7)
 //   Each thread owns h[k_chunk, v_group:v_group+4] = float4[BK/8]
 //
-// No LDS: K/Q loaded directly from global memory; L1 cache provides
-// natural broadcast to 8 V-threads sharing the same K addresses.
+// Use LDS staging for K/Q so each timestep loads once per block and
+// reuses across the 8 V-threads sharing the same K chunk.
 //
 // Grid:  (1, cdiv(V, 32), B * HV)
 // Block: 64 threads = 1 wavefront
@@ -1032,10 +1958,12 @@ void fused_split_gdr_update_kernel_vsplit(
 
     // Interleaved-K mapping:
     // thread 0 -> k={0,8,16,...}, thread 1 -> k={1,9,17,...}, ...
-    // This makes cross-thread K accesses contiguous for a fixed i.
+    // This gives k0..k7 on lanes 0..7 for the same h_vec[i].
     const int v_group     = i_v * V_THREADS + v_thread;
     const int v_col_start = v_group * V_PER_THREAD;
     const bool valid_v    = (v_col_start + V_PER_THREAD - 1 < V_dim);
+
+    __shared__ float smem[BK];
 
     // h_vec[i] = (v0, v1, v2, v3) for K position (k_thread + i * K_THREADS)
     float4 h_vec[K_PER_THREAD];
@@ -1044,8 +1972,8 @@ void fused_split_gdr_update_kernel_vsplit(
         h_vec[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    // Load initial state from standard layout [N, HV, K, V]
-    // Interpreted as [N, HV, K, V/4, 4] — float4 = 4 consecutive V values
+    // Load initial state from vsplit layout [N, HV, V/4, K, 4].
+    // float4 packs 4 contiguous V values for one K position.
     const int V4 = V_dim / 4;
     if constexpr (USE_INITIAL_STATE) {
         const int32_t idx = h0_indices[i_n];
@@ -1059,7 +1987,7 @@ void fused_split_gdr_update_kernel_vsplit(
             for (int i = 0; i < K_PER_THREAD; i++) {
                 const int k = k_thread + i * K_THREADS;
                 if (k < K) {
-                    h_vec[i] = h0_base[static_cast<int64_t>(k) * V4 + v_group];
+                    h_vec[i] = h0_base[static_cast<int64_t>(v_group) * K + k];
                 }
             }
         }
@@ -1085,28 +2013,9 @@ void fused_split_gdr_update_kernel_vsplit(
         o + static_cast<int64_t>(i_n) * stride_o_batch
           + static_cast<int64_t>(i_hv) * stride_o_head;
 
-    __shared__ float smem[BK];
-    const bool use_vec2 = (stride_x_dim == 1);
-
     for (int t = 0; t < T; t++) {
         const __hip_bfloat16* x_t =
             x_base + static_cast<int64_t>(t) * stride_x_seq;
-
-        // Cooperatively load K[BK] into LDS (all 64 threads)
-        if (use_vec2) {
-            const int base = 2 * lane;
-            if (base < BK) {
-                load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
-            }
-        } else {
-            for (int i = lane; i < BK; i += BV) {
-                smem[i] = (i < K)
-                    ? static_cast<float>(
-                          x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim])
-                    : 0.0f;
-            }
-        }
-        __syncthreads();
 
         // Load 4 V values for this thread's V-group
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
@@ -1130,9 +2039,17 @@ void fused_split_gdr_update_kernel_vsplit(
         const float exp_g = expf(g);
         const float beta  = hip_sigmoid(b_t);
 
-        // Phase 1: K-L2-norm + Delta dot (K in smem, 1 value per iteration)
+        // Phase 1: K-L2-norm + Delta dot (LDS staged K)
         float k_inv_norm = 1.0f;
         {
+            for (int kk = lane; kk < BK; kk += BV) {
+                smem[kk] = (kk < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(k_dim_off + kk) * stride_x_dim])
+                    : 0.0f;
+            }
+            __syncthreads();
+
             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
             float k_sq = 0.0f;
             #pragma unroll
@@ -1166,40 +2083,31 @@ void fused_split_gdr_update_kernel_vsplit(
 
         v0 *= beta; v1 *= beta; v2 *= beta; v3 *= beta;
 
-        // Phase 2: Decay + State update (K still in smem)
+        // Phase 2: Decay + State update (reuse staged K)
         {
             const float kv0 = k_inv_norm * v0, kv1 = k_inv_norm * v1;
             const float kv2 = k_inv_norm * v2, kv3 = k_inv_norm * v3;
             #pragma unroll
             for (int i = 0; i < K_PER_THREAD; i++) {
                 const int k = k_thread + i * K_THREADS;
-                const float kval = smem[k];
-                h_vec[i].x = fmaf(h_vec[i].x, exp_g, kval * kv0);
-                h_vec[i].y = fmaf(h_vec[i].y, exp_g, kval * kv1);
-                h_vec[i].z = fmaf(h_vec[i].z, exp_g, kval * kv2);
-                h_vec[i].w = fmaf(h_vec[i].w, exp_g, kval * kv3);
+                const float xval = smem[k];
+                h_vec[i].x = fmaf(h_vec[i].x, exp_g, xval * kv0);
+                h_vec[i].y = fmaf(h_vec[i].y, exp_g, xval * kv1);
+                h_vec[i].z = fmaf(h_vec[i].z, exp_g, xval * kv2);
+                h_vec[i].w = fmaf(h_vec[i].w, exp_g, xval * kv3);
             }
         }
 
-        // Load Q into LDS (reuse smem)
-        __syncthreads();
-        if (use_vec2) {
-            const int base = 2 * lane;
-            if (base < BK) {
-                load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
-            }
-        } else {
-            for (int i = lane; i < BK; i += BV) {
-                smem[i] = (i < K)
+        // Phase 3: Q-L2-norm + Output dot (LDS staged Q)
+        {
+            for (int kk = lane; kk < BK; kk += BV) {
+                smem[kk] = (kk < K)
                     ? static_cast<float>(
-                          x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim])
+                          x_t[static_cast<int64_t>(q_dim_off + kk) * stride_x_dim])
                     : 0.0f;
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // Phase 3: Q-L2-norm + Output dot
-        {
             float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
             float q_sq = 0.0f;
             #pragma unroll
@@ -1237,10 +2145,11 @@ void fused_split_gdr_update_kernel_vsplit(
                 p_o[o_off + static_cast<int64_t>(v_col_start + 3) * stride_o_dim] =
                     static_cast<__hip_bfloat16>(o3 * s);
             }
+            __syncthreads();
         }
     } // end timestep loop
 
-    // Store final state to standard layout [N, HV, K, V]
+    // Store final state to vsplit layout [N, HV, V/4, K, 4].
     if constexpr (USE_INITIAL_STATE) {
         const int32_t idx = h0_indices[i_n];
         if (idx >= 0 && valid_v) {
@@ -1253,7 +2162,269 @@ void fused_split_gdr_update_kernel_vsplit(
             for (int i = 0; i < K_PER_THREAD; i++) {
                 const int k = k_thread + i * K_THREADS;
                 if (k < K) {
-                    h0_base[static_cast<int64_t>(k) * V4 + v_group] = h_vec[i];
+                    h0_base[static_cast<int64_t>(v_group) * K + k] = h_vec[i];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: fused_split_gdr_update_kernel_vsplit_4x16
+//
+// V-split variant with 4x16 thread layout:
+//   - K_THREADS = 4: 4 threads cooperate on K reduction (BK/4 each)
+//   - V_THREADS = 16: 16 V-thread groups per block
+//   - Each thread computes 2 V scalars, so block covers 32 V values
+//   - State layout is [N_states, HV, V/4, K, 4]
+//
+// Reduction width in K path is 4 threads, reducing shuffle stages
+// versus the 8-thread K reduction path.
+// ---------------------------------------------------------------------------
+
+template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
+__global__ __launch_bounds__(BV)
+void fused_split_gdr_update_kernel_vsplit_4x16(
+    const __hip_bfloat16* __restrict__ mixed_qkv,
+    const float*          __restrict__ A_log,
+    const __hip_bfloat16* __restrict__ a,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    float                             softplus_beta,
+    float                             softplus_threshold,
+    const __hip_bfloat16* __restrict__ b_gate,
+    __hip_bfloat16*       __restrict__ o,
+    float*                __restrict__ h0_source,
+    const int32_t*        __restrict__ h0_indices,
+    int T,
+    int key_dim,
+    int value_dim,
+    int64_t stride_x_batch,
+    int64_t stride_x_dim,
+    int64_t stride_x_seq,
+    int64_t stride_o_batch,
+    int64_t stride_o_seq,
+    int64_t stride_o_head,
+    int64_t stride_o_dim,
+    int B,
+    int H,
+    int HV,
+    int K,
+    int V_dim,
+    float scale
+) {
+    static_assert(BV == 64, "vsplit_4x16 requires BV=64");
+    static_assert(BK >= 4 && BK % 4 == 0, "BK must be >= 4 and divisible by 4");
+
+    constexpr int K_THREADS       = 4;
+    constexpr int V_THREADS       = BV / K_THREADS;   // 16
+    constexpr int V_PER_THREAD    = 2;
+    constexpr int K_PER_THREAD    = BK / K_THREADS;   // BK=128 -> 32
+    constexpr int V_GROUP_THREADS = 2;                // 2 threads make one float4 group
+    constexpr int V_GROUPS        = V_THREADS / V_GROUP_THREADS;   // 8
+    constexpr int BV_OUT          = V_THREADS * V_PER_THREAD;      // 32
+
+    const int i_v  = blockIdx.y;
+    const int i_nh = blockIdx.z;
+    const int i_n  = i_nh / HV;
+    const int i_hv = i_nh % HV;
+
+    const int GROUP_SIZE = HV / H;
+    const int i_h  = i_hv / GROUP_SIZE;
+
+    const int lane        = threadIdx.x;
+    const int k_thread    = lane & (K_THREADS - 1);   // 0..3
+    const int v_thread    = lane >> 2;                // 0..15
+    const int v_pair      = v_thread & 1;             // 0: low2, 1: high2 in float4
+    const int v_group     = v_thread >> 1;            // 0..7 (float4 group idx in tile)
+    const int global_vg   = i_v * V_GROUPS + v_group; // V/4 group index
+    const int v_col_start = global_vg * 4 + v_pair * 2;
+    const bool valid_v2   = (v_col_start + 1 < V_dim);
+    const int k_start     = k_thread * K_PER_THREAD;
+
+    __shared__ float smem[BK];
+
+    // Per-thread 2-value state slice.
+    float2 h_vec[K_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < K_PER_THREAD; i++) {
+        h_vec[i] = make_float2(0.0f, 0.0f);
+    }
+
+    // Load initial state from vsplit layout [N, HV, V/4, K, 4].
+    const int V4 = V_dim / 4;
+    if constexpr (USE_INITIAL_STATE) {
+        const int32_t idx = h0_indices[i_n];
+        if (idx >= 0 && valid_v2) {
+            const float4* h0_base = reinterpret_cast<const float4*>(
+                h0_source
+                + static_cast<int64_t>(idx) * HV * K * V_dim
+                + static_cast<int64_t>(i_hv) * K * V_dim
+            );
+            #pragma unroll
+            for (int i = 0; i < K_PER_THREAD; i++) {
+                const int k = k_start + i;
+                if (k < K) {
+                    const float4 st = h0_base[static_cast<int64_t>(global_vg) * K + k];
+                    h_vec[i] = (v_pair == 0)
+                        ? make_float2(st.x, st.y)
+                        : make_float2(st.z, st.w);
+                }
+            }
+        }
+    }
+
+    const float neg_exp_A_log     = -expf(A_log[i_hv]);
+    const float b_dt_bias         = static_cast<float>(dt_bias[i_hv]);
+    const float inv_softplus_beta = 1.0f / softplus_beta;
+
+    const int q_dim_off = i_h  * K;
+    const int k_dim_off = key_dim + i_h * K;
+    const int v_dim_off = 2 * key_dim + i_hv * V_dim;
+
+    const __hip_bfloat16* x_base =
+        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
+
+    const __hip_bfloat16* p_a =
+        a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    const __hip_bfloat16* p_b =
+        b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
+
+    __hip_bfloat16* p_o =
+        o + static_cast<int64_t>(i_n) * stride_o_batch
+          + static_cast<int64_t>(i_hv) * stride_o_head;
+
+    for (int t = 0; t < T; t++) {
+        const __hip_bfloat16* x_t =
+            x_base + static_cast<int64_t>(t) * stride_x_seq;
+
+        float v0 = 0.0f, v1 = 0.0f;
+        if (valid_v2) {
+            v0 = static_cast<float>(
+                x_t[static_cast<int64_t>(v_dim_off + v_col_start) * stride_x_dim]);
+            v1 = static_cast<float>(
+                x_t[static_cast<int64_t>(v_dim_off + v_col_start + 1) * stride_x_dim]);
+        }
+
+        const float a_t = static_cast<float>(p_a[static_cast<int64_t>(t) * HV]);
+        const float b_t = static_cast<float>(p_b[static_cast<int64_t>(t) * HV]);
+
+        const float sp    = hip_softplus(
+            a_t + b_dt_bias, softplus_beta, inv_softplus_beta, softplus_threshold);
+        const float g     = neg_exp_A_log * sp;
+        const float exp_g = expf(g);
+        const float beta  = hip_sigmoid(b_t);
+
+        // Phase 1: K-L2-norm + Delta dot (4-thread K reduction).
+        float k_inv_norm = 1.0f;
+        {
+            for (int kk = lane; kk < BK; kk += BV) {
+                smem[kk] = (kk < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(k_dim_off + kk) * stride_x_dim])
+                    : 0.0f;
+            }
+            __syncthreads();
+
+            float d0 = 0.0f, d1 = 0.0f;
+            float k_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < K_PER_THREAD; i++) {
+                const int k = k_start + i;
+                const float kv = smem[k];
+                d0 = fmaf(h_vec[i].x, kv, d0);
+                d1 = fmaf(h_vec[i].y, kv, d1);
+                if constexpr (USE_QK_L2NORM) {
+                    k_sq = fmaf(kv, kv, k_sq);
+                }
+            }
+            d0 += __shfl_xor(d0, 1, 64); d0 += __shfl_xor(d0, 2, 64);
+            d1 += __shfl_xor(d1, 1, 64); d1 += __shfl_xor(d1, 2, 64);
+            if constexpr (USE_QK_L2NORM) {
+                k_sq += __shfl_xor(k_sq, 1, 64);
+                k_sq += __shfl_xor(k_sq, 2, 64);
+                k_inv_norm = rsqrtf(k_sq + 1e-6f);
+            }
+            const float factor = exp_g * k_inv_norm;
+            v0 -= d0 * factor;
+            v1 -= d1 * factor;
+        }
+
+        v0 *= beta; v1 *= beta;
+
+        // Phase 2: Decay + State update.
+        {
+            const float kv0 = k_inv_norm * v0;
+            const float kv1 = k_inv_norm * v1;
+            #pragma unroll
+            for (int i = 0; i < K_PER_THREAD; i++) {
+                const int k = k_start + i;
+                const float xval = smem[k];
+                h_vec[i].x = fmaf(h_vec[i].x, exp_g, xval * kv0);
+                h_vec[i].y = fmaf(h_vec[i].y, exp_g, xval * kv1);
+            }
+        }
+
+        // Phase 3: Q-L2-norm + Output dot (4-thread K reduction).
+        {
+            for (int kk = lane; kk < BK; kk += BV) {
+                smem[kk] = (kk < K)
+                    ? static_cast<float>(
+                          x_t[static_cast<int64_t>(q_dim_off + kk) * stride_x_dim])
+                    : 0.0f;
+            }
+            __syncthreads();
+
+            float o0 = 0.0f, o1 = 0.0f;
+            float q_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < K_PER_THREAD; i++) {
+                const int k = k_start + i;
+                const float qv = smem[k];
+                o0 = fmaf(h_vec[i].x, qv, o0);
+                o1 = fmaf(h_vec[i].y, qv, o1);
+                if constexpr (USE_QK_L2NORM) {
+                    q_sq = fmaf(qv, qv, q_sq);
+                }
+            }
+            o0 += __shfl_xor(o0, 1, 64); o0 += __shfl_xor(o0, 2, 64);
+            o1 += __shfl_xor(o1, 1, 64); o1 += __shfl_xor(o1, 2, 64);
+            float q_inv_norm = 1.0f;
+            if constexpr (USE_QK_L2NORM) {
+                q_sq += __shfl_xor(q_sq, 1, 64);
+                q_sq += __shfl_xor(q_sq, 2, 64);
+                q_inv_norm = rsqrtf(q_sq + 1e-6f);
+            }
+            if (k_thread == 0 && valid_v2) {
+                const float s = q_inv_norm * scale;
+                const int64_t o_off = static_cast<int64_t>(t) * stride_o_seq;
+                p_o[o_off + static_cast<int64_t>(v_col_start)     * stride_o_dim] =
+                    static_cast<__hip_bfloat16>(o0 * s);
+                p_o[o_off + static_cast<int64_t>(v_col_start + 1) * stride_o_dim] =
+                    static_cast<__hip_bfloat16>(o1 * s);
+            }
+            __syncthreads();
+        }
+    } // end timestep loop
+
+    // Store final state back to vsplit layout [N, HV, V/4, K, 4].
+    if constexpr (USE_INITIAL_STATE) {
+        const int32_t idx = h0_indices[i_n];
+        if (idx >= 0 && valid_v2) {
+            float4* h0_base = reinterpret_cast<float4*>(
+                h0_source
+                + static_cast<int64_t>(idx) * HV * K * V_dim
+                + static_cast<int64_t>(i_hv) * K * V_dim
+            );
+            if (v_pair == 0) {
+                #pragma unroll
+                for (int i = 0; i < K_PER_THREAD; i++) {
+                    const int k = k_start + i;
+                    if (k < K) {
+                        const float z = __shfl_xor(h_vec[i].x, 4, 64);
+                        const float w = __shfl_xor(h_vec[i].y, 4, 64);
+                        h0_base[static_cast<int64_t>(global_vg) * K + k] =
+                            make_float4(h_vec[i].x, h_vec[i].y, z, w);
+                    }
                 }
             }
         }
@@ -1349,10 +2520,103 @@ DEFINE_KSPLIT_WRAPPER(fused_split_gdr_update_ksplit2,
                       fused_split_gdr_update_kernel_ksplit2, 2)
 DEFINE_KSPLIT_WRAPPER(fused_split_gdr_update_ksplit4,
                       fused_split_gdr_update_kernel_ksplit4, 4)
+DEFINE_KSPLIT_WRAPPER(fused_split_gdr_update_ksplit8,
+                      fused_split_gdr_update_kernel_ksplit8, 8)
 DEFINE_KSPLIT_WRAPPER(fused_split_gdr_update_vsplit,
                       fused_split_gdr_update_kernel_vsplit, 2)
+DEFINE_KSPLIT_WRAPPER(fused_split_gdr_update_vsplit_4x16,
+                      fused_split_gdr_update_kernel_vsplit_4x16, 2)
 
 #undef DEFINE_KSPLIT_WRAPPER
+
+// hfuse wrapper: grid Z = B * H (not B * HV)
+torch::Tensor fused_split_gdr_update_ksplit4_hfuse(
+    torch::Tensor mixed_qkv, torch::Tensor A_log, torch::Tensor a,
+    torch::Tensor dt_bias, torch::Tensor b_gate,
+    torch::Tensor initial_state_source, torch::Tensor initial_state_indices,
+    int key_dim, int value_dim, int num_heads_qk, int num_heads_v,
+    int head_dim, float softplus_beta, float softplus_threshold, float scale,
+    bool use_qk_l2norm_in_kernel, c10::optional<torch::Tensor> output
+) {
+    TORCH_CHECK(mixed_qkv.dim() == 3, "mixed_qkv must be 3-D (B, dim, T)");
+    const int B = mixed_qkv.size(0), dim = mixed_qkv.size(1),
+              T = mixed_qkv.size(2);
+    const int H = num_heads_qk, HV = num_heads_v;
+    const int K = head_dim, V = head_dim;
+    TORCH_CHECK(dim == 2 * key_dim + value_dim, "mixed_qkv dim mismatch");
+    TORCH_CHECK(K % 4 == 0, "head_dim must be divisible by 4");
+    TORCH_CHECK(HV % H == 0, "HV must be divisible by H for head fusion");
+    int bk_runtime = 1;
+    while (bk_runtime < K) bk_runtime <<= 1;
+    TORCH_CHECK((K + bk_runtime - 1) / bk_runtime == 1, "NK > 1 unsupported");
+    torch::Tensor o;
+    if (output.has_value()) {
+        o = output.value();
+        TORCH_CHECK(o.size(0)==B && o.size(1)==T && o.size(2)==HV && o.size(3)==V,
+                    "Output shape mismatch");
+    } else { o = torch::empty({B, T, HV, V}, mixed_qkv.options()); }
+    bool use_initial_state = initial_state_source.defined() &&
+                             initial_state_source.numel() > 0;
+    constexpr int BV_VAL = 64;
+    constexpr int BV_OUT = BV_VAL / 4;
+    dim3 grid(1, (V + BV_OUT - 1) / BV_OUT, B * H);
+    dim3 block(BV_VAL);
+    const int64_t stride_x_batch = mixed_qkv.stride(0);
+    const int64_t stride_x_dim   = mixed_qkv.stride(1);
+    const int64_t stride_x_seq   = mixed_qkv.stride(2);
+    const int64_t stride_o_batch = o.stride(0);
+    const int64_t stride_o_seq   = o.stride(1);
+    const int64_t stride_o_head  = o.stride(2);
+    const int64_t stride_o_dim   = o.stride(3);
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    DISPATCH_KS_BK(fused_split_gdr_update_kernel_ksplit4_hfuse);
+    return o;
+}
+
+// hfuse wrapper for ksplit8: grid Z = B * H (not B * HV)
+torch::Tensor fused_split_gdr_update_ksplit8_hfuse(
+    torch::Tensor mixed_qkv, torch::Tensor A_log, torch::Tensor a,
+    torch::Tensor dt_bias, torch::Tensor b_gate,
+    torch::Tensor initial_state_source, torch::Tensor initial_state_indices,
+    int key_dim, int value_dim, int num_heads_qk, int num_heads_v,
+    int head_dim, float softplus_beta, float softplus_threshold, float scale,
+    bool use_qk_l2norm_in_kernel, c10::optional<torch::Tensor> output
+) {
+    TORCH_CHECK(mixed_qkv.dim() == 3, "mixed_qkv must be 3-D (B, dim, T)");
+    const int B = mixed_qkv.size(0), dim = mixed_qkv.size(1),
+              T = mixed_qkv.size(2);
+    const int H = num_heads_qk, HV = num_heads_v;
+    const int K = head_dim, V = head_dim;
+    TORCH_CHECK(dim == 2 * key_dim + value_dim, "mixed_qkv dim mismatch");
+    TORCH_CHECK(K % 4 == 0, "head_dim must be divisible by 4");
+    TORCH_CHECK(HV % H == 0, "HV must be divisible by H for head fusion");
+    int bk_runtime = 1;
+    while (bk_runtime < K) bk_runtime <<= 1;
+    TORCH_CHECK((K + bk_runtime - 1) / bk_runtime == 1, "NK > 1 unsupported");
+    torch::Tensor o;
+    if (output.has_value()) {
+        o = output.value();
+        TORCH_CHECK(o.size(0)==B && o.size(1)==T && o.size(2)==HV && o.size(3)==V,
+                    "Output shape mismatch");
+    } else { o = torch::empty({B, T, HV, V}, mixed_qkv.options()); }
+    bool use_initial_state = initial_state_source.defined() &&
+                             initial_state_source.numel() > 0;
+    constexpr int BV_VAL = 64;
+    constexpr int BV_OUT = BV_VAL / 8;
+    dim3 grid(1, (V + BV_OUT - 1) / BV_OUT, B * H);
+    dim3 block(BV_VAL);
+    const int64_t stride_x_batch = mixed_qkv.stride(0);
+    const int64_t stride_x_dim   = mixed_qkv.stride(1);
+    const int64_t stride_x_seq   = mixed_qkv.stride(2);
+    const int64_t stride_o_batch = o.stride(0);
+    const int64_t stride_o_seq   = o.stride(1);
+    const int64_t stride_o_head  = o.stride(2);
+    const int64_t stride_o_dim   = o.stride(3);
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    DISPATCH_KS_BK(fused_split_gdr_update_kernel_ksplit8_hfuse);
+    return o;
+}
+
 #undef DISPATCH_KS_BK
 #undef DISPATCH_KS_BOOL
 #undef LAUNCH_KS
@@ -1573,10 +2837,108 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("output") = c10::nullopt
     );
     m.def(
+        "fused_split_gdr_update_ksplit8",
+        &fused_split_gdr_update_ksplit8,
+        "Fused Split GDR decode update with K-split=8 (HIP)\n"
+        "K dimension split across 8 threads per V column, row-major layout.\n"
+        "NOTE: State must be in SWIZZLED layout (N_states, HV, K/4, V, 4)",
+        py::arg("mixed_qkv"),
+        py::arg("A_log"),
+        py::arg("a"),
+        py::arg("dt_bias"),
+        py::arg("b_gate"),
+        py::arg("initial_state_source"),
+        py::arg("initial_state_indices"),
+        py::arg("key_dim"),
+        py::arg("value_dim"),
+        py::arg("num_heads_qk"),
+        py::arg("num_heads_v"),
+        py::arg("head_dim"),
+        py::arg("softplus_beta") = 1.0f,
+        py::arg("softplus_threshold") = 20.0f,
+        py::arg("scale") = -1.0f,
+        py::arg("use_qk_l2norm_in_kernel") = true,
+        py::arg("output") = c10::nullopt
+    );
+    m.def(
+        "fused_split_gdr_update_ksplit4_hfuse",
+        &fused_split_gdr_update_ksplit4_hfuse,
+        "Fused Split GDR decode update with K-split=4 + multi-head fusion (HIP)\n"
+        "Fuses HV/H v-heads sharing the same QK head into one block,\n"
+        "loading K/Q only once per timestep.\n"
+        "NOTE: State must be in SWIZZLED layout (N_states, HV, K/4, V, 4)",
+        py::arg("mixed_qkv"),
+        py::arg("A_log"),
+        py::arg("a"),
+        py::arg("dt_bias"),
+        py::arg("b_gate"),
+        py::arg("initial_state_source"),
+        py::arg("initial_state_indices"),
+        py::arg("key_dim"),
+        py::arg("value_dim"),
+        py::arg("num_heads_qk"),
+        py::arg("num_heads_v"),
+        py::arg("head_dim"),
+        py::arg("softplus_beta") = 1.0f,
+        py::arg("softplus_threshold") = 20.0f,
+        py::arg("scale") = -1.0f,
+        py::arg("use_qk_l2norm_in_kernel") = true,
+        py::arg("output") = c10::nullopt
+    );
+    m.def(
+        "fused_split_gdr_update_ksplit8_hfuse",
+        &fused_split_gdr_update_ksplit8_hfuse,
+        "Fused Split GDR decode update with K-split=8 + multi-head fusion (HIP)\n"
+        "Fuses HV/H v-heads sharing the same QK head into one block,\n"
+        "loading K/Q only once per timestep.  8-way K reduction.\n"
+        "NOTE: State must be in SWIZZLED layout (N_states, HV, K/4, V, 4)",
+        py::arg("mixed_qkv"),
+        py::arg("A_log"),
+        py::arg("a"),
+        py::arg("dt_bias"),
+        py::arg("b_gate"),
+        py::arg("initial_state_source"),
+        py::arg("initial_state_indices"),
+        py::arg("key_dim"),
+        py::arg("value_dim"),
+        py::arg("num_heads_qk"),
+        py::arg("num_heads_v"),
+        py::arg("head_dim"),
+        py::arg("softplus_beta") = 1.0f,
+        py::arg("softplus_threshold") = 20.0f,
+        py::arg("scale") = -1.0f,
+        py::arg("use_qk_l2norm_in_kernel") = true,
+        py::arg("output") = c10::nullopt
+    );
+    m.def(
         "fused_split_gdr_update_vsplit",
         &fused_split_gdr_update_vsplit,
         "Fused Split GDR decode update with V-split (HIP)\n"
         "8x8 thread layout: 8 K-threads x 8 V-threads, no LDS.\n"
+        "NOTE: State must be in VSPLIT layout (N_states, HV, V/4, K, 4)",
+        py::arg("mixed_qkv"),
+        py::arg("A_log"),
+        py::arg("a"),
+        py::arg("dt_bias"),
+        py::arg("b_gate"),
+        py::arg("initial_state_source"),
+        py::arg("initial_state_indices"),
+        py::arg("key_dim"),
+        py::arg("value_dim"),
+        py::arg("num_heads_qk"),
+        py::arg("num_heads_v"),
+        py::arg("head_dim"),
+        py::arg("softplus_beta") = 1.0f,
+        py::arg("softplus_threshold") = 20.0f,
+        py::arg("scale") = -1.0f,
+        py::arg("use_qk_l2norm_in_kernel") = true,
+        py::arg("output") = c10::nullopt
+    );
+    m.def(
+        "fused_split_gdr_update_vsplit_4x16",
+        &fused_split_gdr_update_vsplit_4x16,
+        "Fused Split GDR decode update with V-split 4x16 layout (HIP)\n"
+        "4 K-threads x 16 V-threads, block computes 128K x 32V tile.\n"
         "NOTE: State must be in VSPLIT layout (N_states, HV, V/4, K, 4)",
         py::arg("mixed_qkv"),
         py::arg("A_log"),

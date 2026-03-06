@@ -851,7 +851,7 @@ class TestFusedSplitGDRHip:
 
         # ---- vsplit kernel under test ----
         hip_mod = _get_hip_module()
-        ssm_state_hip = inputs["ssm_state"].clone()
+        ssm_state_hip = to_vsplit_layout(inputs["ssm_state"].clone())
 
         output_hip = hip_mod.fused_split_gdr_update_vsplit(
             mixed_qkv=inputs["mixed_qkv"],
@@ -872,7 +872,7 @@ class TestFusedSplitGDRHip:
             use_qk_l2norm_in_kernel=True,
         )
 
-        ssm_state_hip_final = ssm_state_hip
+        ssm_state_hip_final = from_vsplit_layout(ssm_state_hip)
 
         output_diff = (output_ref - output_hip).abs().max().item()
         state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
@@ -908,7 +908,7 @@ class TestFusedSplitGDRHip:
         device,
         dtype,
     ):
-        """Benchmark all four kernels: Triton v3, origin HIP, ksplit2, ksplit4."""
+        """Benchmark kernels: Triton v3, origin HIP, ksplit2/4, vsplit, vsplit_4x16."""
         from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_split_gdr_update_v3,
         )
@@ -931,10 +931,16 @@ class TestFusedSplitGDRHip:
 
         hip_mod = _get_hip_module()
         ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"])
+        ssm_state_vsplit_template = to_vsplit_layout(inputs["ssm_state"])
 
         # Helper: benchmark a callable that takes a cloned state
-        def _benchmark(run_fn, use_swizzled=False):
-            template = ssm_state_swizzled_template if use_swizzled else inputs["ssm_state"]
+        def _benchmark(run_fn, use_swizzled=False, use_vsplit=False):
+            if use_swizzled:
+                template = ssm_state_swizzled_template
+            elif use_vsplit:
+                template = ssm_state_vsplit_template
+            else:
+                template = inputs["ssm_state"]
             for _ in range(num_warmup):
                 run_fn(template.clone())
             torch.cuda.synchronize()
@@ -1012,14 +1018,54 @@ class TestFusedSplitGDRHip:
             use_swizzled=True,
         )
 
-        # 5) vsplit (uses standard [N,HV,K,V] layout, same as other kernels)
+        # 5) ksplit8
+        ksplit8_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_ksplit8(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 6) ksplit4_hfuse
+        ksplit4_hfuse_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_ksplit4_hfuse(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 7) ksplit8_hfuse
+        ksplit8_hfuse_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_ksplit8_hfuse(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_swizzled=True,
+        )
+
+        # 8) vsplit (uses vsplit [N,HV,V/4,K,4] layout)
         vsplit_us = _benchmark(
             lambda st: hip_mod.fused_split_gdr_update_vsplit(
                 **hip_common,
                 initial_state_source=st,
                 initial_state_indices=inputs["ssm_state_indices"],
             ),
-            use_swizzled=False,
+            use_vsplit=True,
+        )
+
+        # 9) vsplit_4x16 (uses vsplit [N,HV,V/4,K,4] layout)
+        vsplit_4x16_us = _benchmark(
+            lambda st: hip_mod.fused_split_gdr_update_vsplit_4x16(
+                **hip_common,
+                initial_state_source=st,
+                initial_state_indices=inputs["ssm_state_indices"],
+            ),
+            use_vsplit=True,
         )
 
         # ============================================================
@@ -1038,7 +1084,11 @@ class TestFusedSplitGDRHip:
         print(f"  {'Origin HIP':<20s} {origin_us:10.2f} {baseline/origin_us:9.3f}x")
         print(f"  {'ksplit2':<20s} {ksplit2_us:10.2f} {baseline/ksplit2_us:9.3f}x")
         print(f"  {'ksplit4':<20s} {ksplit4_us:10.2f} {baseline/ksplit4_us:9.3f}x")
+        print(f"  {'ksplit8':<20s} {ksplit8_us:10.2f} {baseline/ksplit8_us:9.3f}x")
+        print(f"  {'ksplit4_hfuse':<20s} {ksplit4_hfuse_us:10.2f} {baseline/ksplit4_hfuse_us:9.3f}x")
+        print(f"  {'ksplit8_hfuse':<20s} {ksplit8_hfuse_us:10.2f} {baseline/ksplit8_hfuse_us:9.3f}x")
         print(f"  {'vsplit':<20s} {vsplit_us:10.2f} {baseline/vsplit_us:9.3f}x")
+        print(f"  {'vsplit_4x16':<20s} {vsplit_4x16_us:10.2f} {baseline/vsplit_4x16_us:9.3f}x")
         print(f"{'='*70}")
 
 
