@@ -234,7 +234,7 @@ void fused_split_gdr_update_kernel(
             // float4 vectorized loads - each thread loads from consecutive address
             #pragma unroll
             for (int kg = 0; kg < BK4; kg++) {
-                h_vec[kg] = h0_base[kg * V_dim + v_col];
+                    h_vec[kg] = h0_base[kg * V_dim + v_col];
             }
         }
     }
@@ -454,7 +454,7 @@ void fused_split_gdr_update_kernel(
             // float4 vectorized stores
             #pragma unroll
             for (int kg = 0; kg < BK4; kg++) {
-                h0_base[kg * V_dim + v_col] = h_vec[kg];
+                    h0_base[kg * V_dim + v_col] = h_vec[kg];
             }
         }
     }
@@ -851,10 +851,10 @@ void fused_split_gdr_update_kernel_ksplit4(
 
         if (use_vec2) {
             const int base = 2 * lane;
-            if constexpr (SMEM_PAD) {
+                if constexpr (SMEM_PAD) {
                 load_bf16x2_padded_fast<BK_QTR>(smem, x_t + k_dim_off, base);
-            } else {
-                load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
             }
         } else {
             for (int i = lane; i < BK; i += BV) {
@@ -933,10 +933,10 @@ void fused_split_gdr_update_kernel_ksplit4(
         // Load Q into smem
         if (use_vec2) {
             const int base = 2 * lane;
-            if constexpr (SMEM_PAD) {
+                if constexpr (SMEM_PAD) {
                 load_bf16x2_padded_fast<BK_QTR>(smem, x_t + q_dim_off, base);
-            } else {
-                load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
+                } else {
+                    load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
             }
         } else {
             for (int i = lane; i < BK; i += BV) {
@@ -1014,17 +1014,13 @@ void fused_split_gdr_update_kernel_ksplit4(
 // ---------------------------------------------------------------------------
 // Kernel: fused_split_gdr_update_kernel_ksplit4_opt
 //
-// LDS-read-pipelined variant of ksplit4.
-// Phase 1 and Phase 3 use software-pipelined LDS reads: the next iteration's
-// ds_read is issued BEFORE computing on the current iteration's data, so that
-// LDS latency (~20-40 cyc) is hidden behind FMA computation.
-//
-// Pattern per unrolled iteration:
-//   1. Move prefetched data to working regs
-//   2. Issue ds_read for next iteration (overlaps with step 3)
-//   3. Compute FMA / dot / norm with current data
-//
-// Assumes K == BK and V_dim % (BV/4) == 0 (no boundary checks needed).
+// Double-buffer + merged-phase variant of ksplit4.
+// Uses separate smem_k and smem_q so K and Q are loaded simultaneously.
+// Phase 1 (h·k) and Phase 3 (h_new·q) are merged into a single loop using
+// the algebraic identity:
+//   Σ_k(h_new · q) = exp_g · Σ_k(h · q) + kv · Σ_k(k · q)
+// This eliminates the separate Phase-3 loop, its shuffle reduction, and
+// the data dependency from state update to output computation.
 //
 // Grid:  (1, cdiv(V, BV/4), B * HV)
 // Block: BV threads = 1 wavefront
@@ -1099,50 +1095,12 @@ void fused_split_gdr_update_kernel_ksplit4_opt(
     const int k_start_logical = k_split * BK_QTR;
     const int k_start = k_split * SMEM_STRIDE;
 
-    __shared__ float smem[SMEM_SIZE];
+    __shared__ float smem_k[SMEM_SIZE];
+    __shared__ float smem_q[SMEM_SIZE];
 
     const float a_log_val   = A_log[i_hv];
     const float dt_bias_val = static_cast<float>(dt_bias[i_hv]);
 
-    const int q_dim_off = i_h  * K;
-    const int k_dim_off = key_dim + i_h * K;
-    const int v_dim_off = 2 * key_dim + i_hv * V_dim;
-
-    const __hip_bfloat16* x_base =
-        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
-    const __hip_bfloat16* p_a =
-        a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
-    const __hip_bfloat16* p_b =
-        b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
-    __hip_bfloat16* p_o =
-        o + static_cast<int64_t>(i_n) * stride_o_batch
-          + static_cast<int64_t>(i_hv) * stride_o_head;
-
-    const bool use_vec2 = (stride_x_dim == 1);
-
-    // Issue K cooperative load for t=0 BEFORE h0 state loads so that K's
-    // HBM latency (~630 cyc) is hidden behind the 8x global_load_dwordx4.
-    const __hip_bfloat16* x_t0 = x_base;
-    if (use_vec2) {
-        const int base = 2 * lane;
-        if constexpr (SMEM_PAD) {
-            load_bf16x2_padded_fast<BK_QTR>(smem, x_t0 + k_dim_off, base);
-        } else {
-            load_bf16x2(smem, x_t0 + k_dim_off, base, K, BK);
-        }
-    } else {
-        for (int i = lane; i < BK; i += BV) {
-            const float val = static_cast<float>(
-                x_t0[static_cast<int64_t>(k_dim_off + i) * stride_x_dim]);
-            if constexpr (SMEM_PAD) {
-                smem[i + i / BK_QTR] = val;
-            } else {
-                smem[i] = val;
-            }
-        }
-    }
-
-    // h0 state loads overlap with K load's HBM latency above
     float4 h_vec[BK4_QTR];
     #pragma unroll
     for (int i = 0; i < BK4_QTR; i++) {
@@ -1169,38 +1127,58 @@ void fused_split_gdr_update_kernel_ksplit4_opt(
     const float neg_exp_A_log     = -expf(a_log_val);
     const float inv_softplus_beta = 1.0f / softplus_beta;
 
-    // t=0: K already loaded to smem above; t>0: load K at loop top
+    const int q_dim_off = i_h  * K;
+    const int k_dim_off = key_dim + i_h * K;
+    const int v_dim_off = 2 * key_dim + i_hv * V_dim;
+
+    const __hip_bfloat16* x_base =
+        mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
+    const __hip_bfloat16* p_a =
+        a      + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    const __hip_bfloat16* p_b =
+        b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    __hip_bfloat16* p_o =
+        o + static_cast<int64_t>(i_n) * stride_o_batch
+          + static_cast<int64_t>(i_hv) * stride_o_head;
+
+    const bool use_vec2 = (stride_x_dim == 1);
+
     for (int t = 0; t < T; t++) {
         const __hip_bfloat16* x_t =
             x_base + static_cast<int64_t>(t) * stride_x_seq;
+
+        if (use_vec2) {
+            const int base = 2 * lane;
+            if constexpr (SMEM_PAD) {
+                load_bf16x2_padded_fast<BK_QTR>(smem_k, x_t + k_dim_off, base);
+                load_bf16x2_padded_fast<BK_QTR>(smem_q, x_t + q_dim_off, base);
+            } else {
+                load_bf16x2(smem_k, x_t + k_dim_off, base, K, BK);
+                load_bf16x2(smem_q, x_t + q_dim_off, base, K, BK);
+            }
+        } else {
+            for (int i = lane; i < BK; i += BV) {
+                const float q_val = static_cast<float>(
+                    x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim]);
+                const float k_val = static_cast<float>(
+                    x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim]);
+                if constexpr (SMEM_PAD) {
+                    smem_q[i + i / BK_QTR] = q_val;
+                    smem_k[i + i / BK_QTR] = k_val;
+                } else {
+                    smem_q[i] = q_val;
+                    smem_k[i] = k_val;
+                }
+            }
+        }
 
         const __hip_bfloat16 v_raw =
             x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim];
         const __hip_bfloat16 a_raw = p_a[static_cast<int64_t>(t) * HV];
         const __hip_bfloat16 b_raw = p_b[static_cast<int64_t>(t) * HV];
 
-        if (t > 0) {
-            if (use_vec2) {
-                const int base = 2 * lane;
-                if constexpr (SMEM_PAD) {
-                    load_bf16x2_padded_fast<BK_QTR>(smem, x_t + k_dim_off, base);
-                } else {
-                    load_bf16x2(smem, x_t + k_dim_off, base, K, BK);
-                }
-            } else {
-                for (int i = lane; i < BK; i += BV) {
-                    const float val = static_cast<float>(
-                        x_t[static_cast<int64_t>(k_dim_off + i) * stride_x_dim]);
-                    if constexpr (SMEM_PAD) {
-                        smem[i + i / BK_QTR] = val;
-                    } else {
-                        smem[i] = val;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-
+        // Gating computation moved before barrier: softplus/exp/sigmoid
+        // ALU hides ds_write latency (~20-40 cyc) while LDS commits complete.
         float v_local = static_cast<float>(v_raw);
         const float a_t = static_cast<float>(a_raw);
         const float b_t = static_cast<float>(b_raw);
@@ -1211,120 +1189,90 @@ void fused_split_gdr_update_kernel_ksplit4_opt(
         const float exp_g = expf(g);
         const float beta  = hip_sigmoid(b_t);
 
-        // Phase 1: Pipelined K-L2-norm + Delta dot
-        //   Prefetch next iteration's LDS data while computing on current.
+        __syncthreads();
+
+        // Merged Phase: compute h·k, h·q, k·q, and K/Q L2 norms in one pass.
         float4 k_cache[BK4_QTR];
         float k_inv_norm = 1.0f;
+        float q_inv_norm = 1.0f;
+        float dot_partial, hq_old, dot_kq;
         {
-            float dot_partial = 0.0f;
-            float k_sq = 0.0f;
+            float dp = 0.0f, hq = 0.0f, dkq = 0.0f;
+            float k_sq = 0.0f, q_sq = 0.0f;
 
-            float pf0 = smem[k_start], pf1 = smem[k_start + 1];
-            float pf2 = smem[k_start + 2], pf3 = smem[k_start + 3];
+            float kf0 = smem_k[k_start],     kf1 = smem_k[k_start + 1];
+            float kf2 = smem_k[k_start + 2], kf3 = smem_k[k_start + 3];
+            float qf0 = smem_q[k_start],     qf1 = smem_q[k_start + 1];
+            float qf2 = smem_q[k_start + 2], qf3 = smem_q[k_start + 3];
 
             #pragma unroll
             for (int i = 0; i < BK4_QTR; i++) {
-                const float s0 = pf0, s1 = pf1, s2 = pf2, s3 = pf3;
+                const float ks0 = kf0, ks1 = kf1, ks2 = kf2, ks3 = kf3;
+                const float qs0 = qf0, qs1 = qf1, qs2 = qf2, qs3 = qf3;
 
                 if (i + 1 < BK4_QTR) {
-                    const int k0_next = k_start + (i + 1) * 4;
-                    pf0 = smem[k0_next];     pf1 = smem[k0_next + 1];
-                    pf2 = smem[k0_next + 2]; pf3 = smem[k0_next + 3];
+                    const int next = k_start + (i + 1) * 4;
+                    kf0 = smem_k[next];     kf1 = smem_k[next + 1];
+                    kf2 = smem_k[next + 2]; kf3 = smem_k[next + 3];
+                    qf0 = smem_q[next];     qf1 = smem_q[next + 1];
+                    qf2 = smem_q[next + 2]; qf3 = smem_q[next + 3];
                 }
 
-                k_cache[i] = make_float4(s0, s1, s2, s3);
-                dot_partial += h_vec[i].x * s0 + h_vec[i].y * s1
-                             + h_vec[i].z * s2 + h_vec[i].w * s3;
+                k_cache[i] = make_float4(ks0, ks1, ks2, ks3);
+
+                dp  += h_vec[i].x * ks0 + h_vec[i].y * ks1
+                     + h_vec[i].z * ks2 + h_vec[i].w * ks3;
+                hq  += h_vec[i].x * qs0 + h_vec[i].y * qs1
+                     + h_vec[i].z * qs2 + h_vec[i].w * qs3;
+                dkq += ks0 * qs0 + ks1 * qs1 + ks2 * qs2 + ks3 * qs3;
+
                 if constexpr (USE_QK_L2NORM) {
-                    k_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                    k_sq += ks0 * ks0 + ks1 * ks1 + ks2 * ks2 + ks3 * ks3;
+                    q_sq += qs0 * qs0 + qs1 * qs1 + qs2 * qs2 + qs3 * qs3;
                 }
             }
-            dot_partial += __shfl_xor(dot_partial, 16, 64);
-            dot_partial += __shfl_xor(dot_partial, 32, 64);
+            dp  += __shfl_xor(dp,  16, 64);
+            hq  += __shfl_xor(hq,  16, 64);
+            dkq += __shfl_xor(dkq, 16, 64);
+            dp  += __shfl_xor(dp,  32, 64);
+            hq  += __shfl_xor(hq,  32, 64);
+            dkq += __shfl_xor(dkq, 32, 64);
             if constexpr (USE_QK_L2NORM) {
                 k_sq += __shfl_xor(k_sq, 16, 64);
+                q_sq += __shfl_xor(q_sq, 16, 64);
                 k_sq += __shfl_xor(k_sq, 32, 64);
+                q_sq += __shfl_xor(q_sq, 32, 64);
                 k_inv_norm = rsqrtf(k_sq + 1e-6f);
+                q_inv_norm = rsqrtf(q_sq + 1e-6f);
             }
-            v_local -= dot_partial * exp_g * k_inv_norm;
+            dot_partial = dp;
+            hq_old = hq;
+            dot_kq = dkq;
         }
 
+        v_local -= dot_partial * exp_g * k_inv_norm;
         v_local *= beta;
+        const float kv = k_inv_norm * v_local;
 
-        // Phase 2: Fused Decay + State update (reuse cached K, no LDS re-read)
+        // Output via algebraic identity (no Phase-3 loop / shuffle needed)
         {
-            const float kv = k_inv_norm * v_local;
+            const float o_local =
+                (exp_g * hq_old + kv * dot_kq) * q_inv_norm * scale;
+            if (k_split == 0) {
+                p_o[static_cast<int64_t>(t) * stride_o_seq
+                    + static_cast<int64_t>(v_col) * stride_o_dim] =
+                    static_cast<__hip_bfloat16>(o_local);
+            }
+        }
+
+        // State update (after output — no data dependency)
+        {
             #pragma unroll
             for (int i = 0; i < BK4_QTR; i++) {
                 h_vec[i].x = h_vec[i].x * exp_g + k_cache[i].x * kv;
                 h_vec[i].y = h_vec[i].y * exp_g + k_cache[i].y * kv;
                 h_vec[i].z = h_vec[i].z * exp_g + k_cache[i].z * kv;
                 h_vec[i].w = h_vec[i].w * exp_g + k_cache[i].w * kv;
-            }
-        }
-
-        // Load Q into smem — no barrier needed here because BV == wavefront
-        // size (64 on gfx942): single-wavefront lockstep guarantees all K
-        // smem reads in Phase 1 complete before any Q smem writes begin.
-        if (use_vec2) {
-            const int base = 2 * lane;
-            if constexpr (SMEM_PAD) {
-                load_bf16x2_padded_fast<BK_QTR>(smem, x_t + q_dim_off, base);
-            } else {
-                load_bf16x2(smem, x_t + q_dim_off, base, K, BK);
-            }
-        } else {
-            for (int i = lane; i < BK; i += BV) {
-                const float val = static_cast<float>(
-                    x_t[static_cast<int64_t>(q_dim_off + i) * stride_x_dim]);
-                if constexpr (SMEM_PAD) {
-                    smem[i + i / BK_QTR] = val;
-                } else {
-                    smem[i] = val;
-                }
-            }
-        }
-        __syncthreads();
-
-        // Phase 3: Pipelined Q-L2-norm + Output dot
-        //   Same prefetch technique as Phase 1.
-        {
-            float out_partial = 0.0f;
-            float q_sq = 0.0f;
-
-            float qf0 = smem[k_start], qf1 = smem[k_start + 1];
-            float qf2 = smem[k_start + 2], qf3 = smem[k_start + 3];
-
-            #pragma unroll
-            for (int i = 0; i < BK4_QTR; i++) {
-                const float s0 = qf0, s1 = qf1, s2 = qf2, s3 = qf3;
-
-                if (i + 1 < BK4_QTR) {
-                    const int k0_next = k_start + (i + 1) * 4;
-                    qf0 = smem[k0_next];     qf1 = smem[k0_next + 1];
-                    qf2 = smem[k0_next + 2]; qf3 = smem[k0_next + 3];
-                }
-
-                out_partial += h_vec[i].x * s0 + h_vec[i].y * s1
-                             + h_vec[i].z * s2 + h_vec[i].w * s3;
-                if constexpr (USE_QK_L2NORM) {
-                    q_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
-                }
-            }
-            out_partial += __shfl_xor(out_partial, 16, 64);
-            out_partial += __shfl_xor(out_partial, 32, 64);
-            float q_inv_norm = 1.0f;
-            if constexpr (USE_QK_L2NORM) {
-                q_sq += __shfl_xor(q_sq, 16, 64);
-                q_sq += __shfl_xor(q_sq, 32, 64);
-                q_inv_norm = rsqrtf(q_sq + 1e-6f);
-            }
-            float o_local = out_partial * q_inv_norm * scale;
-
-            if (k_split == 0) {
-                p_o[static_cast<int64_t>(t) * stride_o_seq
-                    + static_cast<int64_t>(v_col) * stride_o_dim] =
-                    static_cast<__hip_bfloat16>(o_local);
             }
         }
     }

@@ -18,7 +18,8 @@ def get_cuda_autotune_config():
 
 def get_hip_autotune_config():
     return [
-        triton.Config({'BV': 64}, num_stages=1, num_warps=4),
+        # triton.Config({'BV': 64}, num_stages=1, num_warps=4),
+        triton.Config({'BV': 32}, num_stages=3, num_warps=1),
     ]
 
 def get_autotune_config():

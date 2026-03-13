@@ -796,6 +796,101 @@ class TestFusedSplitGDRHip:
         print(f"  PASS — ksplit4 correctness test passed!")
 
     # ------------------------------------------------------------------
+    # Correctness test — ksplit4_db kernel against torch CPU reference
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("seqlen", [1, 4])
+    @pytest.mark.parametrize("num_heads_qk", [2, 4, 16])
+    @pytest.mark.parametrize("num_heads_v", [4, 8, 32])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_split_gdr_ksplit4_db_correctness(
+        self,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        device,
+        dtype,
+    ):
+        """Test correctness of ksplit4_db (double-buffer) HIP kernel."""
+        if num_heads_v < num_heads_qk:
+            pytest.skip("num_heads_v must be >= num_heads_qk")
+        torch.manual_seed(42)
+
+        inputs = self.create_inputs(
+            batch_size, seqlen, num_heads_qk, num_heads_v, head_dim, device, dtype,
+        )
+
+        key_dim = inputs["key_dim"]
+        value_dim = inputs["value_dim"]
+
+        softplus_beta = 1.0
+        softplus_threshold = 20.0
+        scale = head_dim ** -0.5
+
+        ssm_state_ref = inputs["ssm_state"].clone()
+        output_ref = split_gdr_reference(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b=inputs["b"],
+            initial_state_source=ssm_state_ref,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        hip_mod = _get_hip_module()
+        ssm_state_hip = inputs["ssm_state"].clone()
+        ssm_state_swizzled = to_swizzled_layout(ssm_state_hip)
+
+        output_hip = hip_mod.fused_split_gdr_update_ksplit4_db(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b_gate=inputs["b"],
+            initial_state_source=ssm_state_swizzled,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        ssm_state_hip_final = from_swizzled_layout(ssm_state_swizzled)
+
+        output_diff = (output_ref - output_hip).abs().max().item()
+        state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
+
+        print(f"\n{'='*70}")
+        print(f"Split GDR ksplit4_db Correctness: batch={batch_size}, seqlen={seqlen}")
+        print(f"  heads_qk={num_heads_qk}, heads_v={num_heads_v}, head_dim={head_dim}")
+        print(f"{'='*70}")
+        print(f"  Output max diff: {output_diff:.6f}")
+        print(f"  State  max diff: {state_diff:.6f}")
+        print(f"{'='*70}")
+
+        assert output_diff < 5e-3, f"Output diff too large: {output_diff}"
+        assert state_diff < 5e-3, f"State diff too large: {state_diff}"
+        print(f"  PASS — ksplit4_db correctness test passed!")
+
+    # ------------------------------------------------------------------
     # Correctness test — vsplit kernel against torch CPU reference
     # ------------------------------------------------------------------
 
